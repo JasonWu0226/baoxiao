@@ -1,0 +1,52 @@
+{
+  "email": {
+    "imap_server": "imap.qq.com",
+    "imap_port": 993,
+    "username": "290432815@qq.com",
+    "password": "",
+    "password_env": "INVOICE_MAIL_PASSWORD",
+    "folder": "INBOX",
+    "start_time": "2026-01-01",
+    "end_time": "",
+    "use_ssl": true
+  },
+  "paths": {
+    "save_dir": "所有发票",
+    "record_json": "规则/发票邮件处理记录.json",
+    "record_csv": "输出/发票邮件处理记录.csv"
+  },
+  "rules": {
+    "invoice_keywords": [
+      "发票",
+      "电子发票",
+      "增值税发票",
+      "专票",
+      "普票",
+      "数电票",
+      "报销",
+      "开票",
+      "invoice"
+    ],
+    "legal_extensions": [
+      ".pdf",
+      ".ofd",
+      ".xml",
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".zip"
+    ],
+    "preferred_extensions": [
+      ".pdf",
+      ".ofd",
+      ".xml",
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".zip"
+    ],
+    "skip_completed": true,
+    "prefer_pdf": true,
+    "keep_duplicate_file": false
+  }
+}

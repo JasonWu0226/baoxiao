@@ -1,0 +1,32 @@
+# Local secrets and machine-specific config
+matcher_config.json
+invoice_mail_config.json
+*.user
+*.suo
+
+# Reimbursement source data and generated output
+所有发票/
+历史发票/
+报销准备的资料/
+早期资料/
+规则/
+输出/
+自动化报销匹配工作台/
+
+# Build artifacts
+bin/
+obj/
+src/**/bin/
+src/**/obj/
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/
