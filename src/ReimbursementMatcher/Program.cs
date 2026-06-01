@@ -78,6 +78,15 @@ static class Program
             Console.WriteLine($"已归档非PDF重复格式文件：{moved}");
             return;
         }
+        if (arg == "--process-nonpdf-qr")
+        {
+            var output = new NonPdfInvoiceMaintenanceService(workspace, Console.WriteLine)
+                .ProcessAsync(config)
+                .GetAwaiter()
+                .GetResult();
+            Console.WriteLine(output);
+            return;
+        }
         throw new ArgumentException("未知参数：" + arg);
     }
 }

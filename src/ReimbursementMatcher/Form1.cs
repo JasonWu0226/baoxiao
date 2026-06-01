@@ -11,6 +11,8 @@ public partial class Form1 : Form
     private readonly ConfirmationService _confirmations;
     private readonly ReportService _reporter;
     private readonly InvoiceFileCleaner _invoiceCleaner;
+    private readonly NonPdfInvoiceMaintenanceService _nonPdfMaintenance;
+    private readonly AiReviewService _aiReviewService;
     private readonly EmailAuditReportService _emailAuditReporter;
     private readonly EmailAuditService _emailAuditService;
 
@@ -54,6 +56,13 @@ public partial class Form1 : Form
     private readonly TextBox _emailStart = new();
     private readonly TextBox _emailEnd = new();
     private readonly TextBox _emailInterval = new();
+    private readonly CheckBox _aiEnabled = new() { Text = "启用大模型辅助判断", AutoSize = true };
+    private readonly TextBox _aiBaseUrl = new();
+    private readonly TextBox _aiApiKey = new() { UseSystemPasswordChar = true };
+    private readonly TextBox _aiModel = new();
+    private readonly TextBox _aiVisionModel = new();
+    private readonly TextBox _aiConfidence = new();
+    private readonly TextBox _aiMaxItems = new();
 
     private readonly TextBox _noteBox = new() { Dock = DockStyle.Fill };
     private readonly TextBox _invoiceNoteBox = new() { Dock = DockStyle.Fill };
@@ -77,6 +86,8 @@ public partial class Form1 : Form
         _confirmations = new ConfirmationService(_workspace);
         _reporter = new ReportService(_workspace);
         _invoiceCleaner = new InvoiceFileCleaner(_workspace);
+        _nonPdfMaintenance = new NonPdfInvoiceMaintenanceService(_workspace, Log);
+        _aiReviewService = new AiReviewService(_workspace, Log);
         _emailAuditReporter = new EmailAuditReportService(_workspace);
         _emailAuditService = new EmailAuditService(_workspace);
         BuildLayout();
@@ -170,7 +181,8 @@ public partial class Form1 : Form
     private TabPage BuildInvoicePage()
     {
         var page = new TabPage("发票下载核验") { BackColor = Color.White, AutoScroll = true };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 4, ColumnCount = 1 };
+        layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -187,6 +199,7 @@ public partial class Form1 : Form
         layout.Controls.Add(hint, 0, 0);
 
         layout.Controls.Add(BuildEmailPanel(), 0, 1);
+        layout.Controls.Add(BuildAiPanel(), 0, 2);
 
         var middle = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
         middle.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 72));
@@ -199,7 +212,7 @@ public partial class Form1 : Form
         left.Controls.Add(_invoiceGrid, 0, 1);
         middle.Controls.Add(left, 0, 0);
         middle.Controls.Add(BuildInvoiceSidePanel(), 1, 0);
-        layout.Controls.Add(middle, 0, 2);
+        layout.Controls.Add(middle, 0, 3);
         return page;
     }
 
@@ -234,6 +247,7 @@ public partial class Form1 : Form
         buttons.Controls.Add(Button("生成邮件统计Excel", (_, _) => GenerateEmailAuditReport()));
         buttons.Controls.Add(Button("打开清单目录", (_, _) => OpenDir(_config.Email.OutputDir)));
         buttons.Controls.Add(Button("归档非PDF重复格式", (_, _) => ArchiveNonPdfInvoiceFormats()));
+        buttons.Controls.Add(Button("处理非PDF/二维码/AI判断", async (s, _) => await ProcessNonPdfAndQrAsync(s as Button)));
         buttons.Controls.Add(new Label
         {
             Text = "重点看状态为“未下载到文件”“失败”“需人工确认”的行；这些代表邮件里可能有发票，但程序没能直接下载成文件。",
@@ -264,6 +278,7 @@ public partial class Form1 : Form
         buttons.Controls.Add(Button("读取邮件判断清单", (_, _) => LoadEmailAuditItems(), primary: true));
         buttons.Controls.Add(Button("生成邮件判断Excel", (_, _) => GenerateEmailChecklistExcel()));
         buttons.Controls.Add(Button("保存下载规则", (_, _) => SaveEmailDownloadRules()));
+        buttons.Controls.Add(Button("大模型判断待确认", async (s, _) => await AiReviewPendingEmailsAsync(s as Button)));
         buttons.Controls.Add(Button("选中标有发票", (_, _) => ConfirmSelectedEmails(EmailAuditService.HasInvoice)));
         buttons.Controls.Add(Button("选中标无发票", (_, _) => ConfirmSelectedEmails(EmailAuditService.NoInvoice)));
         buttons.Controls.Add(Button("当前显示全部无发票", (_, _) => ConfirmVisibleEmailsNoInvoice()));
@@ -363,6 +378,35 @@ public partial class Form1 : Form
         AddLabeled(panel, "请求间隔秒", _emailInterval, 3, 2, 1);
 
         AddLabeled(panel, "保存到目录", _emailOutput, 0, 3, 4);
+        return group;
+    }
+
+    private Control BuildAiPanel()
+    {
+        var group = new GroupBox { Text = "大模型辅助判断", Dock = DockStyle.Top, Padding = new Padding(8), AutoSize = true };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 4, RowCount = 3, AutoSize = true };
+        for (var i = 0; i < 4; i++) panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
+        group.Controls.Add(panel);
+
+        panel.Controls.Add(_aiEnabled, 0, 0);
+        var aiHint = new Label
+        {
+            Text = "用于不确定邮件、非PDF图片、二维码取票后的辅助判断。API Key 会保存到本机配置文件。",
+            AutoSize = true,
+            ForeColor = Color.FromArgb(102, 112, 133),
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft
+        };
+        panel.Controls.Add(aiHint, 1, 0);
+        panel.SetColumnSpan(aiHint, 2);
+        panel.Controls.Add(Button("测试大模型", async (s, _) => await TestAiAsync(s as Button)), 3, 0);
+
+        AddLabeled(panel, "BaseUrl", _aiBaseUrl, 0, 1, 2);
+        AddLabeled(panel, "API Key", _aiApiKey, 2, 1, 2);
+        AddLabeled(panel, "文本模型", _aiModel, 0, 2, 1);
+        AddLabeled(panel, "视觉模型", _aiVisionModel, 1, 2, 1);
+        AddLabeled(panel, "置信阈值", _aiConfidence, 2, 2, 1);
+        AddLabeled(panel, "每次最多", _aiMaxItems, 3, 2, 1);
         return group;
     }
 
@@ -500,6 +544,13 @@ public partial class Form1 : Form
         _emailStart.Text = _config.Email.Start;
         _emailEnd.Text = _config.Email.End;
         _emailInterval.Text = _config.Email.RequestIntervalSec.ToString("0.###");
+        _aiEnabled.Checked = _config.Ai.Enabled;
+        _aiBaseUrl.Text = _config.Ai.BaseUrl;
+        _aiApiKey.Text = _config.Ai.ApiKey;
+        _aiModel.Text = _config.Ai.Model;
+        _aiVisionModel.Text = _config.Ai.VisionModel;
+        _aiConfidence.Text = _config.Ai.ConfidenceThreshold.ToString("0.##");
+        _aiMaxItems.Text = _config.Ai.MaxItemsPerRun.ToString();
 
         _store = _confirmations.Load(_config);
         _emailDecisionStore = _emailAuditService.LoadDecisions(_config);
@@ -527,6 +578,13 @@ public partial class Form1 : Form
         _config.Email.Start = string.IsNullOrWhiteSpace(_emailStart.Text) ? _config.DateStart : _emailStart.Text.Trim();
         _config.Email.End = string.IsNullOrWhiteSpace(_emailEnd.Text) ? _config.DateEnd : _emailEnd.Text.Trim();
         _config.Email.RequestIntervalSec = double.TryParse(_emailInterval.Text.Trim(), out var interval) ? interval : 0.1;
+        _config.Ai.Enabled = _aiEnabled.Checked;
+        _config.Ai.BaseUrl = string.IsNullOrWhiteSpace(_aiBaseUrl.Text) ? "https://api.mimo-v2.com/v1" : _aiBaseUrl.Text.Trim();
+        _config.Ai.ApiKey = _aiApiKey.Text.Trim();
+        _config.Ai.Model = string.IsNullOrWhiteSpace(_aiModel.Text) ? "mimo-v2.5-pro" : _aiModel.Text.Trim();
+        _config.Ai.VisionModel = string.IsNullOrWhiteSpace(_aiVisionModel.Text) ? _config.Ai.Model : _aiVisionModel.Text.Trim();
+        _config.Ai.ConfidenceThreshold = double.TryParse(_aiConfidence.Text.Trim(), out var threshold) ? Math.Clamp(threshold, 0, 1) : 0.75;
+        _config.Ai.MaxItemsPerRun = int.TryParse(_aiMaxItems.Text.Trim(), out var maxItems) ? Math.Max(1, maxItems) : 50;
 
         _workspace.SaveConfig(_config);
         Log("配置已保存。");
@@ -1070,6 +1128,104 @@ public partial class Form1 : Form
         Log($"已归档非PDF重复格式文件：{moved} 个。");
         ScanMaterials();
         MessageBox.Show($"已归档 {moved} 个同一发票已有 PDF 的非 PDF 格式文件。", "归档完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private async Task ProcessNonPdfAndQrAsync(Button? button)
+    {
+        SaveConfig();
+        await RunButtonTaskAsync(button, async () =>
+        {
+            var result = await _nonPdfMaintenance.ProcessAsync(_config);
+            Log(result);
+            ScanMaterials();
+            MessageBox.Show(result, "处理完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }, "处理非PDF/二维码失败");
+    }
+
+    private async Task TestAiAsync(Button? button)
+    {
+        SaveConfig();
+        await RunButtonTaskAsync(button, async () =>
+        {
+            var result = await _aiReviewService.TestAsync(_config);
+            Log("大模型测试返回：" + result);
+            MessageBox.Show(result, "大模型测试", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }, "大模型测试失败");
+    }
+
+    private async Task AiReviewPendingEmailsAsync(Button? button)
+    {
+        SaveConfig();
+        if (_allEmailAuditItems.Count == 0)
+        {
+            LoadEmailAuditItems(showMessageWhenMissing: false);
+        }
+        if (_allEmailAuditItems.Count == 0)
+        {
+            return;
+        }
+
+        await RunButtonTaskAsync(button, async () =>
+        {
+            var targets = _allEmailAuditItems
+                .Where(i => i.NeedsHumanReview && string.IsNullOrWhiteSpace(i.ManualDecision))
+                .Take(_config.Ai.MaxItemsPerRun)
+                .ToList();
+            if (targets.Count == 0)
+            {
+                Log("没有需要大模型辅助判断的邮件。");
+                return;
+            }
+
+            var applied = 0;
+            var reviewed = 0;
+            foreach (var item in targets)
+            {
+                var result = await _aiReviewService.ReviewEmailAsync(_config, item);
+                reviewed++;
+                var decision = result.Decision switch
+                {
+                    "has_invoice" => EmailAuditService.HasInvoice,
+                    "no_invoice" => EmailAuditService.NoInvoice,
+                    _ => EmailAuditService.NeedsReview
+                };
+
+                if (result.Confidence < _config.Ai.ConfidenceThreshold)
+                {
+                    decision = EmailAuditService.NeedsReview;
+                }
+
+                var note = $"AI辅助：{decision}；置信度 {result.Confidence:0.##}；{result.Reason}";
+                _emailAuditService.Confirm(_config, _emailDecisionStore, item, decision, note);
+                if (decision != EmailAuditService.NeedsReview)
+                {
+                    applied++;
+                }
+                Log($"AI判断邮件：{item.Subject} -> {decision}（{result.Confidence:0.##}）");
+            }
+
+            LoadEmailAuditItems(showMessageWhenMissing: false);
+            SaveEmailDownloadRules();
+            Log($"大模型辅助判断完成：处理 {reviewed} 封，自动明确 {applied} 封。");
+        }, "大模型辅助判断失败");
+    }
+
+    private async Task RunButtonTaskAsync(Button? button, Func<Task> action, string errorTitle)
+    {
+        if (button != null) button.Enabled = false;
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            Log(errorTitle + "：" + ex.Message);
+            MessageBox.Show(ex.Message, errorTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            if (button != null) button.Enabled = true;
+        }
     }
 
     private void GenerateEmailAuditReport()

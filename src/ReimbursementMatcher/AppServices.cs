@@ -807,6 +807,16 @@ public sealed class InvoiceFileCleaner
         foreach (var file in Directory.EnumerateFiles(invoiceDir, "*.*", SearchOption.AllDirectories).ToList())
         {
             var ext = Path.GetExtension(file).ToLowerInvariant();
+            if (ext == ".ico")
+            {
+                var relativeIcon = Path.GetRelativePath(invoiceDir, file);
+                var targetIcon = UniquePath(Path.Combine(archiveRoot, relativeIcon));
+                Directory.CreateDirectory(Path.GetDirectoryName(targetIcon)!);
+                File.Move(file, targetIcon);
+                File.WriteAllText(targetIcon + ".reason.txt", "ICO 图标不是发票。" + Environment.NewLine, Encoding.UTF8);
+                moved++;
+                continue;
+            }
             if (ext == ".pdf" || ext == ".csv" || ext == ".xlsx" || ext == ".json")
             {
                 continue;

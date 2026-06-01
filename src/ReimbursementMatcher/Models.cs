@@ -14,6 +14,7 @@ public sealed class AppConfig
     public string DateStart { get; set; } = "2026-01-01";
     public string DateEnd { get; set; } = "2026-04-30";
     public EmailConfig Email { get; set; } = new();
+    public AiConfig Ai { get; set; } = new();
 }
 
 public sealed class EmailConfig
@@ -28,6 +29,17 @@ public sealed class EmailConfig
     public string Start { get; set; } = "2026-01-01";
     public string End { get; set; } = "2026-04-30";
     public double RequestIntervalSec { get; set; } = 0.1;
+}
+
+public sealed class AiConfig
+{
+    public bool Enabled { get; set; }
+    public string BaseUrl { get; set; } = "https://api.mimo-v2.com/v1";
+    public string ApiKey { get; set; } = "";
+    public string Model { get; set; } = "mimo-v2.5-pro";
+    public string VisionModel { get; set; } = "mimo-v2-omni";
+    public double ConfidenceThreshold { get; set; } = 0.75;
+    public int MaxItemsPerRun { get; set; } = 50;
 }
 
 public sealed class EvidenceItem
@@ -167,6 +179,15 @@ public sealed class EmailAuditItem
     public string Files { get; set; } = "";
     public string Urls { get; set; } = "";
     public string Note { get; set; } = "";
+}
+
+public sealed class AiReviewResult
+{
+    public string Decision { get; set; } = "needs_review";
+    public double Confidence { get; set; }
+    public string Reason { get; set; } = "";
+    public string Action { get; set; } = "";
+    public string Url { get; set; } = "";
 }
 
 public sealed class EmailDecisionStore
