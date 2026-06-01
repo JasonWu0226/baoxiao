@@ -36,7 +36,9 @@ public sealed class EmailDownloader
 
     private static readonly string[] InvoiceMailKeywords =
     [
-        "发票", "电子发票", "增值税发票", "专票", "普票", "数电票", "报销", "开票", "invoice"
+        "发票", "电子发票", "增值税发票", "专票", "普票", "数电票", "报销", "开票",
+        "发票金额", "报销凭证", "电子报销凭证", "行程单", "客票行程单",
+        "invoice", "fapiao", "dzfp", ".pdf", ".ofd", ".xml", ".zip"
     ];
 
     private readonly WorkspaceService _workspace;
@@ -106,11 +108,11 @@ public sealed class EmailDownloader
                 .Where(p => AllowedExtensions.Contains(Path.GetExtension(p.FileName ?? "")))
                 .ToList();
             var attachmentTotal = attachmentParts.Count;
-            var attachmentNames = attachmentParts.Select(p => p.FileName ?? "attachment").ToList();
-            var keywordHits = FindKeywordHits($"{subject}\n{msg.TextBody}\n{StripHtml(msg.HtmlBody)}");
-            var isInvoiceMail = keywordHits.Count > 0;
+            var attachmentNames = attachmentParts.Select(p => TextEncodingFixer.Fix(p.FileName ?? "attachment")).ToList();
             var links = ExtractLinks(msg).Where(LooksLikeInvoiceLink).GroupBy(l => l.Url).Select(g => g.First()).ToList();
-            if (onlyAbnormal && !IsPreviouslyAbnormal(processingStore, messageKey))
+            var keywordHits = FindKeywordHits($"{subject}\n{msg.TextBody}\n{StripHtml(msg.HtmlBody)}\n{string.Join("\n", attachmentNames)}\n{string.Join("\n", links.Select(l => l.Url))}");
+            var isInvoiceMail = keywordHits.Count > 0;
+            if (onlyAbnormal && !IsPreviouslyAbnormal(processingStore, messageKey, isInvoiceMail, attachmentTotal, links.Count))
             {
                 continue;
             }
@@ -133,12 +135,14 @@ public sealed class EmailDownloader
                 });
                 continue;
             }
-            if (IsPreviouslyCompleted(processingStore, messageKey))
+            if (IsPreviouslyCompleted(processingStore, messageKey, isInvoiceMail, attachmentTotal, links.Count))
             {
+                var existingFiles = ExistingFilesForMessage(processingStore, messageKey);
                 rows.Add(new Dictionary<string, string>
                 {
                     ["kind"] = "message",
                     ["status"] = "已处理跳过",
+                    ["download_status"] = existingFiles.Count > 0 ? "已存在" : "",
                     ["date"] = date,
                     ["subject"] = subject,
                     ["sender"] = sender,
@@ -147,8 +151,11 @@ public sealed class EmailDownloader
                     ["message_key"] = messageKey,
                     ["attachment_total"] = attachmentTotal.ToString(),
                     ["link_candidate_total"] = links.Count.ToString(),
-                    ["saved_file_count"] = "0",
-                    ["error"] = "该邮件此前已成功处理且无异常，本次不重复下载"
+                    ["saved_file_count"] = existingFiles.Count.ToString(),
+                    ["file"] = string.Join("；", existingFiles),
+                    ["error"] = existingFiles.Count > 0
+                        ? $"该邮件此前已成功处理，本地已存在 {existingFiles.Count} 个文件，本次不重复下载"
+                        : "该邮件此前已成功处理且无异常，本次不重复下载"
                 });
                 continue;
             }
@@ -158,7 +165,7 @@ public sealed class EmailDownloader
                 : new EmailProcessingRecord { MessageKey = messageKey };
             existingRecord.Attempts += 1;
 
-            if (!isInvoiceMail || attachmentTotal == 0 && links.Count == 0)
+            if (attachmentTotal == 0 && links.Count == 0)
             {
                 var status = isInvoiceMail ? "异常" : "非发票邮件";
                 var error = isInvoiceMail ? "无附件" : "无关键词";
@@ -307,23 +314,69 @@ public sealed class EmailDownloader
         return Path.Combine(_workspace.Resolve(config.RuleDir), "邮箱处理记录.json");
     }
 
-    private static bool IsPreviouslyCompleted(EmailProcessingStore store, string messageKey)
+    private static bool IsPreviouslyCompleted(EmailProcessingStore store, string messageKey, bool currentIsInvoiceMail, int currentAttachmentTotal, int currentLinkCount)
     {
         if (!store.Messages.TryGetValue(messageKey, out var record))
         {
             return false;
         }
-        if (record.HasRisk || record.Status is "失败" or "需人工确认" or "未下载到文件" or "异常")
+        if (record.HasRisk || record.Status is "失败" or "需人工确认" or "未下载到文件" or "异常" or "链接取票待处理")
         {
             return false;
         }
-        return record.Files.Count == 0 || record.Files.All(File.Exists);
+
+        var currentHasInvoiceSignal = currentIsInvoiceMail || currentAttachmentTotal > 0 || currentLinkCount > 0;
+        if (record.Status is "无发票内容已跳过" or "非发票邮件" or "人工确认无发票跳过")
+        {
+            return !currentHasInvoiceSignal;
+        }
+
+        return !IsInvoiceRecordWithoutExistingFile(record, currentHasInvoiceSignal);
     }
 
-    private static bool IsPreviouslyAbnormal(EmailProcessingStore store, string messageKey)
+    private static bool IsPreviouslyAbnormal(EmailProcessingStore store, string messageKey, bool currentIsInvoiceMail, int currentAttachmentTotal, int currentLinkCount)
     {
+        var currentHasInvoiceSignal = currentIsInvoiceMail || currentAttachmentTotal > 0 || currentLinkCount > 0;
         return store.Messages.TryGetValue(messageKey, out var record)
-            && (record.HasRisk || record.Status is "失败" or "需人工确认" or "未下载到文件" or "异常");
+            && (record.HasRisk
+                || record.Status is "失败" or "需人工确认" or "未下载到文件" or "异常" or "链接取票待处理"
+                || IsInvoiceRecordWithoutExistingFile(record, currentHasInvoiceSignal));
+    }
+
+    private static List<string> ExistingFilesForMessage(EmailProcessingStore store, string messageKey)
+    {
+        if (!store.Messages.TryGetValue(messageKey, out var record))
+        {
+            return [];
+        }
+
+        return record.Files
+            .Concat(record.SavedFiles.Select(f => f.Path))
+            .Where(p => !string.IsNullOrWhiteSpace(p) && File.Exists(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static bool IsInvoiceRecordWithoutExistingFile(EmailProcessingRecord record, bool currentHasInvoiceSignal)
+    {
+        var hasInvoiceSignal = currentHasInvoiceSignal
+            || record.IsInvoiceMail
+            || record.AttachmentTotal > 0
+            || record.LinkCandidateTotal > 0
+            || record.Status is "正常已下载" or "已下载" or "PDF已存在跳过" or "重复发票" or "重复已存在" or "已处理跳过";
+
+        if (!hasInvoiceSignal)
+        {
+            return false;
+        }
+
+        var files = record.Files
+            .Concat(record.SavedFiles.Select(f => f.Path))
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return files.Count == 0 || files.Any(p => !File.Exists(p));
     }
 
     private static bool IsManuallyMarkedNoInvoice(EmailDecisionStore store, string messageKey)
@@ -665,13 +718,13 @@ public sealed class EmailDownloader
         }
         var messagePdfKeys = parts
             .Where(p => Path.GetExtension(p.FileName ?? "").Equals(".pdf", StringComparison.OrdinalIgnoreCase))
-            .Select(p => InvoiceFormatPolicy.InvoiceKey(p.FileName ?? "", subject))
+            .Select(p => InvoiceFormatPolicy.InvoiceKey(TextEncodingFixer.Fix(p.FileName ?? ""), subject))
             .Where(k => !string.IsNullOrWhiteSpace(k))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         foreach (var part in parts)
         {
-            var fileName = part.FileName ?? "attachment.bin";
+            var fileName = TextEncodingFixer.Fix(part.FileName ?? "attachment.bin");
             var ext = Path.GetExtension(fileName);
             if (part.Content == null)
             {
