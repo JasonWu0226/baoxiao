@@ -36,6 +36,7 @@ public sealed class AiConfig
     public bool Enabled { get; set; }
     public string BaseUrl { get; set; } = "https://api.mimo-v2.com/v1";
     public string ApiKey { get; set; } = "";
+    public string ProxyUrl { get; set; } = "";
     public string Model { get; set; } = "mimo-v2.5-pro";
     public string VisionModel { get; set; } = "mimo-v2-omni";
     public double ConfidenceThreshold { get; set; } = 0.75;

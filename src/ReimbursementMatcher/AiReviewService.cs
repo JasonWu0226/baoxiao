@@ -102,7 +102,7 @@ JSON 格式：
 
     private async Task<string> ChatAsync(AppConfig config, string model, string prompt, string? imagePath, CancellationToken ct)
     {
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        using var http = CreateHttpClient(config);
         using var request = new HttpRequestMessage(HttpMethod.Post, ChatEndpoint(config.Ai.BaseUrl));
         request.Headers.TryAddWithoutValidation("api-key", config.Ai.ApiKey);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.Ai.ApiKey);
@@ -152,6 +152,21 @@ JSON 格式：
             return new Uri(trimmed);
         }
         return new Uri($"{trimmed}/chat/completions");
+    }
+
+    private static HttpClient CreateHttpClient(AppConfig config)
+    {
+        if (!string.IsNullOrWhiteSpace(config.Ai.ProxyUrl))
+        {
+            var handler = new HttpClientHandler
+            {
+                Proxy = new System.Net.WebProxy(config.Ai.ProxyUrl.Trim()),
+                UseProxy = true
+            };
+            return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) };
+        }
+
+        return new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
     }
 
     private static string ToDataUrl(string path)

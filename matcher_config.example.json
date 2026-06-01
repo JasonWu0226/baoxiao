@@ -24,6 +24,7 @@
     "Enabled": false,
     "BaseUrl": "https://api.mimo-v2.com/v1",
     "ApiKey": "",
+    "ProxyUrl": "",
     "Model": "mimo-v2.5-pro",
     "VisionModel": "mimo-v2-omni",
     "ConfidenceThreshold": 0.75,

@@ -59,6 +59,7 @@ public partial class Form1 : Form
     private readonly CheckBox _aiEnabled = new() { Text = "启用大模型辅助判断", AutoSize = true };
     private readonly TextBox _aiBaseUrl = new();
     private readonly TextBox _aiApiKey = new() { UseSystemPasswordChar = true };
+    private readonly TextBox _aiProxyUrl = new();
     private readonly TextBox _aiModel = new();
     private readonly TextBox _aiVisionModel = new();
     private readonly TextBox _aiConfidence = new();
@@ -384,7 +385,7 @@ public partial class Form1 : Form
     private Control BuildAiPanel()
     {
         var group = new GroupBox { Text = "大模型辅助判断", Dock = DockStyle.Top, Padding = new Padding(8), AutoSize = true };
-        var panel = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 4, RowCount = 3, AutoSize = true };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 4, RowCount = 4, AutoSize = true };
         for (var i = 0; i < 4; i++) panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
         group.Controls.Add(panel);
 
@@ -403,10 +404,11 @@ public partial class Form1 : Form
 
         AddLabeled(panel, "BaseUrl", _aiBaseUrl, 0, 1, 2);
         AddLabeled(panel, "API Key", _aiApiKey, 2, 1, 2);
-        AddLabeled(panel, "文本模型", _aiModel, 0, 2, 1);
-        AddLabeled(panel, "视觉模型", _aiVisionModel, 1, 2, 1);
-        AddLabeled(panel, "置信阈值", _aiConfidence, 2, 2, 1);
-        AddLabeled(panel, "每次最多", _aiMaxItems, 3, 2, 1);
+        AddLabeled(panel, "代理地址(可选)", _aiProxyUrl, 0, 2, 4);
+        AddLabeled(panel, "文本模型", _aiModel, 0, 3, 1);
+        AddLabeled(panel, "视觉模型", _aiVisionModel, 1, 3, 1);
+        AddLabeled(panel, "置信阈值", _aiConfidence, 2, 3, 1);
+        AddLabeled(panel, "每次最多", _aiMaxItems, 3, 3, 1);
         return group;
     }
 
@@ -547,6 +549,7 @@ public partial class Form1 : Form
         _aiEnabled.Checked = _config.Ai.Enabled;
         _aiBaseUrl.Text = _config.Ai.BaseUrl;
         _aiApiKey.Text = _config.Ai.ApiKey;
+        _aiProxyUrl.Text = _config.Ai.ProxyUrl;
         _aiModel.Text = _config.Ai.Model;
         _aiVisionModel.Text = _config.Ai.VisionModel;
         _aiConfidence.Text = _config.Ai.ConfidenceThreshold.ToString("0.##");
@@ -581,6 +584,7 @@ public partial class Form1 : Form
         _config.Ai.Enabled = _aiEnabled.Checked;
         _config.Ai.BaseUrl = string.IsNullOrWhiteSpace(_aiBaseUrl.Text) ? "https://api.mimo-v2.com/v1" : _aiBaseUrl.Text.Trim();
         _config.Ai.ApiKey = _aiApiKey.Text.Trim();
+        _config.Ai.ProxyUrl = _aiProxyUrl.Text.Trim();
         _config.Ai.Model = string.IsNullOrWhiteSpace(_aiModel.Text) ? "mimo-v2.5-pro" : _aiModel.Text.Trim();
         _config.Ai.VisionModel = string.IsNullOrWhiteSpace(_aiVisionModel.Text) ? _config.Ai.Model : _aiVisionModel.Text.Trim();
         _config.Ai.ConfidenceThreshold = double.TryParse(_aiConfidence.Text.Trim(), out var threshold) ? Math.Clamp(threshold, 0, 1) : 0.75;
