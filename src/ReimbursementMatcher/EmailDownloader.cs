@@ -69,6 +69,8 @@ public sealed class EmailDownloader
         var existingHashes = BuildExistingHashIndex(outputDir);
         var existingPdfKeys = BuildExistingPdfKeyIndex(outputDir);
         var processingStore = LoadProcessingStore(config);
+        processingStore.Invoices = BuildExistingInvoiceIndex(outputDir);
+        _log($"基于实际发票文件建立查重索引：{processingStore.Invoices.Count} 个");
         var decisionStore = LoadDecisionStore(config);
 
         using var client = new ImapClient();
@@ -1255,6 +1257,60 @@ public sealed class EmailDownloader
             .Select(file => InvoiceFormatPolicy.InvoiceKey(Path.GetFileName(file), file))
             .Where(key => !string.IsNullOrWhiteSpace(key))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, EmailInvoiceRecord> BuildExistingInvoiceIndex(string outputDir)
+    {
+        var result = new Dictionary<string, EmailInvoiceRecord>(StringComparer.OrdinalIgnoreCase);
+        if (!Directory.Exists(outputDir))
+        {
+            return result;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(outputDir, "*.*", SearchOption.AllDirectories))
+        {
+            var extension = Path.GetExtension(file);
+            if (extension.Equals(".csv", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            try
+            {
+                var bytes = File.ReadAllBytes(file);
+                var md5 = Md5(bytes);
+                var sha256 = Sha256(bytes);
+                var metadata = ExtractInvoiceMetadata(file);
+                var invoiceKey = BuildInvoiceKey(md5, metadata);
+                if (string.IsNullOrWhiteSpace(invoiceKey))
+                {
+                    invoiceKey = $"sha256:{sha256}";
+                }
+
+                result.TryAdd(invoiceKey, new EmailInvoiceRecord
+                {
+                    InvoiceKey = invoiceKey,
+                    MessageKey = "existing-file",
+                    MessageId = "",
+                    Subject = Path.GetFileName(file),
+                    Sender = "",
+                    Date = File.GetLastWriteTime(file).ToString("yyyy-MM-dd"),
+                    Path = file,
+                    Md5 = md5,
+                    Sha256 = sha256,
+                    InvoiceNumber = metadata.InvoiceNumber,
+                    InvoiceAmount = metadata.Amount,
+                    InvoiceDate = metadata.Date,
+                    UpdatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+                });
+            }
+            catch
+            {
+                // Ignore unreadable files; they will not participate in duplicate detection.
+            }
+        }
+
+        return result;
     }
 
     private static async Task<SaveResult> SaveBytesAsync(byte[] bytes, string outputDir, string fileName, Dictionary<string, string> existingHashes, CancellationToken ct)
