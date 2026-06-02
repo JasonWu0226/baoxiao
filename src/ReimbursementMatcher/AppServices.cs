@@ -351,6 +351,7 @@ public sealed class MaterialScanner
         var date = !string.IsNullOrWhiteSpace(meta.Date) ? meta.Date : ExtractDate(text);
         var invoiceNo = !string.IsNullOrWhiteSpace(meta.InvoiceNumber) ? meta.InvoiceNumber : ExtractInvoiceNo(text);
         var title = BuildTitle(kind, platform, text, file);
+        var vendor = !string.IsNullOrWhiteSpace(meta.Vendor) ? meta.Vendor : ExtractVendor(text);
 
         return new EvidenceItem
         {
@@ -360,7 +361,7 @@ public sealed class MaterialScanner
             Date = date,
             Amount = amount,
             Title = title,
-            Vendor = ExtractVendor(text),
+            Vendor = vendor,
             InvoiceNumber = invoiceNo,
             FilePath = file,
             RelativePath = relative,
@@ -562,6 +563,53 @@ public sealed class MaterialScanner
         return fallback ?? "";
     }
 
+    private static string ExtractVendorFromInvoiceText(string text)
+    {
+        var patterns = new[]
+        {
+            @"销售方信息.{0,120}?名称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"销方名称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"销售方名称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"<[^>]*(?:SellerName|Seller|Xsfmc|XSFMC)[^>]*>\s*([^<]{4,80})\s*</"
+        };
+
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(text, pattern, RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            if (match.Success)
+            {
+                var value = CleanVendor(match.Groups[1].Value);
+                if (!string.IsNullOrWhiteSpace(value) && !LooksLikeInvoiceTableHeader(value))
+                {
+                    return value;
+                }
+            }
+        }
+
+        var betweenTaxIds = Regex.Match(text, @"91440300MA5ECG7E71\s+(.{4,80}?)\s+[0-9A-Z]{15,20}", RegexOptions.Singleline);
+        if (betweenTaxIds.Success)
+        {
+            var value = CleanVendor(betweenTaxIds.Groups[1].Value);
+            if (!string.IsNullOrWhiteSpace(value) && !LooksLikeInvoiceTableHeader(value))
+            {
+                return value;
+            }
+        }
+
+        return "";
+    }
+
+    private static string CleanVendor(string value)
+    {
+        return Regex.Replace(value ?? "", @"\s+", "").Trim();
+    }
+
+    private static bool LooksLikeInvoiceTableHeader(string value)
+    {
+        var keywords = new[] { "项目名称", "规格型号", "统一社会信用代码", "纳税人识别号", "下载次数", "税率", "征收率", "单价", "金额", "名称名称" };
+        return keywords.Any(k => value.Contains(k, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static string ExtractVendor(string text)
     {
         var fileName = Path.GetFileNameWithoutExtension(text);
@@ -739,7 +787,8 @@ public sealed class MaterialScanner
             {
                 InvoiceNumber = invoiceNo ?? "",
                 Amount = amount,
-                Date = date ?? ""
+                Date = date ?? "",
+                Vendor = ExtractVendorFromInvoiceText(doc.ToString(System.Xml.Linq.SaveOptions.DisableFormatting))
             };
         }
         catch
@@ -763,7 +812,8 @@ public sealed class MaterialScanner
             {
                 InvoiceNumber = ExtractInvoiceNo(text),
                 Amount = ExtractAmount(text),
-                Date = ExtractDate(text)
+                Date = ExtractDate(text),
+                Vendor = ExtractVendorFromInvoiceText(text)
             };
         }
         catch
@@ -777,6 +827,7 @@ public sealed class MaterialScanner
         public string InvoiceNumber { get; set; } = "";
         public decimal Amount { get; set; }
         public string Date { get; set; } = "";
+        public string Vendor { get; set; } = "";
     }
 }
 
@@ -1427,7 +1478,7 @@ public sealed class ReportService
             ws.Cell(row, 2).Value = item.Date;
             ws.Cell(row, 3).Value = item.Amount;
             ws.Cell(row, 4).Value = item.Kind == EvidenceKinds.Invoice ? "有" : "否";
-            ws.Cell(row, 5).Value = item.Title;
+            ws.Cell(row, 5).Value = BuildExpenseReason(item);
             ws.Cell(row, 6).Value = item.Project;
             ws.Cell(row, 8).Value = config.Operator;
             ws.Cell(row, 9).Value = item.InvoiceNumber;
@@ -1460,6 +1511,46 @@ public sealed class ReportService
         {
             ws.Range(4, 2, Math.Max(last, 4), 9).Clear(XLClearOptions.Contents);
         }
+    }
+
+    private static string BuildExpenseReason(EvidenceItem item)
+    {
+        var title = item.Title.Trim();
+        var vendor = CleanVendorForReason(item.Vendor);
+        if (string.IsNullOrWhiteSpace(vendor) || !IsFoodOrHotelExpense(item))
+        {
+            return title;
+        }
+
+        return title.Contains(vendor, StringComparison.OrdinalIgnoreCase)
+            ? title
+            : $"{title}（{vendor}）";
+    }
+
+    private static bool IsFoodOrHotelExpense(EvidenceItem item)
+    {
+        var text = $"{item.Title} {item.Platform} {item.Vendor} {item.RelativePath}";
+        return ContainsAny(text, "餐饮", "餐费", "饭店", "餐厅", "饮食", "外卖", "美团", "三快",
+            "住宿", "酒店", "宾馆", "旅馆", "客房", "携程");
+    }
+
+    private static string CleanVendorForReason(string vendor)
+    {
+        vendor = Regex.Replace(vendor ?? "", @"\s+", "").Trim();
+        return vendor is "" or "发票" or "电子发票" or "深圳博锐创科技有限公司"
+            ? ""
+            : ShortenText(vendor, 36);
+    }
+
+    private static bool ContainsAny(string value, params string[] keywords)
+    {
+        return keywords.Any(k => value.Contains(k, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string ShortenText(string value, int max)
+    {
+        value = value.Trim();
+        return value.Length <= max ? value : value[..max];
     }
 
     private static void WriteListSheet(XLWorkbook wb, string name, List<EvidenceItem> items)
