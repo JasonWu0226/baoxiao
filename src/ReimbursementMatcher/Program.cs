@@ -6,11 +6,11 @@ static class Program
     ///  The main entry point for the application.
     /// </summary>
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
-        if (Environment.GetCommandLineArgs().Skip(1).FirstOrDefault() is { } arg && arg.StartsWith("--"))
+        if (args.FirstOrDefault() is { } arg && arg.StartsWith("--"))
         {
-            RunCommand(arg);
+            RunCommand(args);
             return;
         }
 
@@ -20,8 +20,9 @@ static class Program
         Application.Run(new Form1());
     }
 
-    private static void RunCommand(string arg)
+    private static void RunCommand(string[] args)
     {
+        var arg = args[0];
         var workspace = new WorkspaceService();
         var config = workspace.LoadConfig();
         if (arg == "--scan")
@@ -102,6 +103,13 @@ static class Program
         if (arg == "--consolidate-pdf-invoices")
         {
             var output = new PdfInvoiceConsolidationService(workspace).Generate(config);
+            Console.WriteLine(output);
+            return;
+        }
+        if (arg == "--invoice-recognition-audit")
+        {
+            var sourceDir = args.Skip(1).FirstOrDefault();
+            var output = new InvoiceRecognitionAuditService(workspace).Generate(config, sourceDir);
             Console.WriteLine(output);
             return;
         }
