@@ -559,17 +559,28 @@ public sealed class PreviousReimbursementIndexService
     private static List<string> ExtractInvoiceNumbers(string text)
     {
         var numbers = new List<string>();
+
+        var oldStyle = Regex.Matches(text, @"发票代码\s*[:：]?\s*([0-9]{10,12}).{0,80}?发票号码\s*[:：]?\s*([0-9]{8})", RegexOptions.Singleline);
+        numbers.AddRange(oldStyle.Select(m => NormalizeInvoiceNo(m.Groups[1].Value + m.Groups[2].Value)));
+
         var labeled = Regex.Matches(text, @"(?:发票号码|发票号|电子发票号码|EIid|InvoiceNumber)[_：:\s-]*([0-9]{8,30})", RegexOptions.IgnoreCase);
-        numbers.AddRange(labeled.Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
+        numbers.AddRange(labeled
+            .Select(m => NormalizeInvoiceNo(m.Groups[1].Value))
+            .Where(v => v.Length >= 18));
+
         numbers.AddRange(Regex.Matches(text, @"(?<!\d)([0-9]{10,12})\s+([0-9]{8})(?!\d)")
             .Select(m => NormalizeInvoiceNo(m.Groups[1].Value + m.Groups[2].Value)));
+
         var dzfp = Regex.Matches(text, @"dzfp[_-]([0-9]{12,30})", RegexOptions.IgnoreCase);
         numbers.AddRange(dzfp.Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
+
         numbers.AddRange(Regex.Matches(text, @"(?<!\d)([0-9]{18,24})(?!\d)")
             .Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
+
         return numbers
             .Where(v => !string.IsNullOrWhiteSpace(v))
             .Where(v => !LooksLikeNumericTaxId(v))
+            .Where(v => !LooksLikeDateNoise(v))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
@@ -581,6 +592,7 @@ public sealed class PreviousReimbursementIndexService
 
     private static string NormalizeInvoiceNo(string value)
     {
+        value = Regex.Replace(value, @"\D", "");
         if (value.Length > 20 && !value.StartsWith("20", StringComparison.Ordinal))
         {
             value = value[..20];
@@ -593,9 +605,22 @@ public sealed class PreviousReimbursementIndexService
         return value.Length == 18 && (value.StartsWith("91", StringComparison.Ordinal) || value.StartsWith("92", StringComparison.Ordinal));
     }
 
+    private static bool LooksLikeDateNoise(string value)
+    {
+        if (Regex.IsMatch(value, @"^20\d{6}20\d{6}\d*$"))
+        {
+            return true;
+        }
+
+        var dateTokens = Regex.Matches(value, @"20\d{6}")
+            .Select(m => m.Value)
+            .Count(v => DateTime.TryParseExact(v, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _));
+        return dateTokens >= 2;
+    }
+
     private static string ExtractDate(string text)
     {
-        var match = Regex.Match(text, @"(20\d{2})[-_.年/](\d{1,2})[-_.月/](\d{1,2})");
+        var match = Regex.Match(text, @"(20\d{2})\s*[-_.年/]\s*(\d{1,2})\s*[-_.月/]\s*(\d{1,2})");
         if (match.Success)
         {
             var value = $"{int.Parse(match.Groups[1].Value):0000}-{int.Parse(match.Groups[2].Value):00}-{int.Parse(match.Groups[3].Value):00}";
@@ -657,12 +682,96 @@ public sealed class PreviousReimbursementIndexService
 
     private static string ExtractVendor(string text)
     {
-        var seller = Regex.Match(text, @"销售方信息.{0,80}?名称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,40})");
-        if (seller.Success) return seller.Groups[1].Value.Trim();
+        var patterns = new[]
+        {
+            @"销售方信息.{0,120}?名\s*称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"销售方\s*名\s*称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"销方\s*名\s*称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"销\s*货\s*方.{0,40}?名\s*称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"<[^>]*(?:SellerName|Seller|Xsfmc|XSFMC)[^>]*>\s*([^<]{4,80})\s*</"
+        };
+
+        foreach (var pattern in patterns)
+        {
+            var match = Regex.Match(text, pattern, RegexOptions.Singleline | RegexOptions.IgnoreCase);
+            if (match.Success)
+            {
+                var value = CleanVendor(match.Groups[1].Value);
+                if (LooksLikeValidVendor(value))
+                {
+                    return value;
+                }
+            }
+        }
+
+        var fileNameVendor = Regex.Match(text, @"[0-9]+(?:\.[0-9]{1,2})?元-([^-\\/:]{4,60}?)-20\d{2}[._-]?\d{1,2}", RegexOptions.Singleline);
+        if (fileNameVendor.Success)
+        {
+            var value = CleanVendor(fileNameVendor.Groups[1].Value);
+            if (LooksLikeValidVendor(value))
+            {
+                return value;
+            }
+        }
 
         var name = Path.GetFileNameWithoutExtension(text);
         var parts = Regex.Split(name, @"[_\s]+").Where(p => p.Length >= 4).ToList();
-        return parts.FirstOrDefault(p => p.Any(ch => ch >= '\u4e00' && ch <= '\u9fff')) ?? "";
+        return parts.FirstOrDefault(p =>
+            p.Any(ch => ch >= '\u4e00' && ch <= '\u9fff')
+            && LooksLikeValidVendor(p)
+            && p.Length <= 40) ?? "";
+    }
+
+    private static string CleanVendor(string value)
+    {
+        return Regex.Replace(value ?? "", @"\s+", "").Trim();
+    }
+
+    private static bool LooksLikeValidVendor(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        value = CleanVendor(value);
+        if (value.Length < 4 || value.Length > 80)
+        {
+            return false;
+        }
+
+        if (LooksLikeInvoiceTableHeader(value) || LooksLikeVendorNoise(value))
+        {
+            return false;
+        }
+
+        return ContainsAny(value,
+            "公司", "分公司", "有限公司", "商贸", "科技", "餐", "饭", "酒店", "宾馆", "烧烤",
+            "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店");
+    }
+
+    private static bool LooksLikeVendorNoise(string value)
+    {
+        if (ContainsAny(value, ":", "：", ";", "；", "项目名称", "规格型号", "统一社会信用代码", "纳税人识别号",
+            "下载次数", "税率", "征收率", "单价", "金额", "发票代码", "发票号码", "开票日期", "银行账号", "账号",
+            "复核人", "开票人", "收款人", "机器编号", "校验码", "电子支付标识", "密码区", "电话", "地址", "车牌号"))
+        {
+            return true;
+        }
+
+        var chineseCount = value.Count(ch => ch >= '\u4e00' && ch <= '\u9fff');
+        if (chineseCount < 2)
+        {
+            return true;
+        }
+
+        return Regex.IsMatch(value, @"^[0-9A-Za-z%+\-*<>.]+$");
+    }
+
+    private static bool LooksLikeInvoiceTableHeader(string value)
+    {
+        return ContainsAny(value, "项目名称", "规格型号", "统一社会信用代码", "纳税人识别号", "下载次数", "税率", "征收率", "单价", "金额", "名称名称",
+            "发票代码", "发票号码", "开票日期", "银行账号", "复核人", "开票人", "收款人", "机器编号", "校验码");
     }
 
     private static string DetectCategory(string text)
