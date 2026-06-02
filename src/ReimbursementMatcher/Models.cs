@@ -11,6 +11,8 @@ public sealed class AppConfig
     public string RuleDir { get; set; } = "规则";
     public string ArchiveDir { get; set; } = "输出/归档";
     public List<string> PreviousInvoiceDirs { get; set; } = new();
+    public string CompanyName { get; set; } = "深圳博锐创科技有限公司";
+    public string CompanyTaxId { get; set; } = "91440300MA5ECG7E71";
     public string Operator { get; set; } = "Jason";
     public string DateStart { get; set; } = "2026-01-01";
     public string DateEnd { get; set; } = "2026-04-30";

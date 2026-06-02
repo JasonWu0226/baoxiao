@@ -30,7 +30,8 @@ public sealed class PdfInvoiceConsolidationService
 
         var rows = Directory.EnumerateFiles(invoiceDir, "*.pdf", SearchOption.AllDirectories)
             .Where(f => !IsInsideOutputOrArchive(f, invoiceDir))
-            .Select(ReadPdf)
+            .Select(file => ReadPdf(file, config))
+            .Where(row => IsInConfiguredDateRange(row, config))
             .OrderBy(r => r.InvoiceDate)
             .ThenBy(r => r.Category)
             .ThenBy(r => r.InvoiceNumber)
@@ -79,7 +80,7 @@ public sealed class PdfInvoiceConsolidationService
         return workbookPath;
     }
 
-    private static PdfInvoiceRow ReadPdf(string path)
+    private static PdfInvoiceRow ReadPdf(string path, AppConfig config)
     {
         var text = ExtractPdfText(path);
         var combined = $"{Path.GetFileName(path)} {path} {text}";
@@ -93,9 +94,11 @@ public sealed class PdfInvoiceConsolidationService
             InvoiceNumber = ExtractInvoiceNo(combined),
             Amount = ExtractAmount(combined),
             InvoiceDate = ExtractDate(combined),
+            BuyerName = ExtractBuyerName(combined),
             Vendor = ExtractVendor(combined),
             Category = DetectCategory(combined)
         };
+        row.IsCompanyBuyer = IsCompanyBuyer(row.BuyerName, combined, config);
         return row;
     }
 
@@ -124,6 +127,26 @@ public sealed class PdfInvoiceConsolidationService
             : $"sha:{row.Sha256}";
     }
 
+    private static bool IsInConfiguredDateRange(PdfInvoiceRow row, AppConfig config)
+    {
+        if (!DateOnly.TryParse(row.InvoiceDate, out var invoiceDate))
+        {
+            return true;
+        }
+
+        if (DateOnly.TryParse(config.DateStart, out var start) && invoiceDate < start)
+        {
+            return false;
+        }
+
+        if (DateOnly.TryParse(config.DateEnd, out var end) && invoiceDate > end)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     private static string CopyUniquePdf(string pdfRoot, PdfInvoiceRow row)
     {
         var fileName = SafeFileName(string.Join("_", new[]
@@ -142,32 +165,20 @@ public sealed class PdfInvoiceConsolidationService
 
     private List<PreviousInvoiceRow> BuildPreviousIndex(AppConfig config, string currentInvoiceDir)
     {
-        var roots = config.PreviousInvoiceDirs
-            .Where(v => !string.IsNullOrWhiteSpace(v))
-            .Select(_workspace.Resolve)
-            .Concat(FindAutoPreviousInvoiceDirs(config))
-            .Where(Directory.Exists)
-            .Where(dir => !Path.GetFullPath(dir).Equals(Path.GetFullPath(currentInvoiceDir), StringComparison.OrdinalIgnoreCase))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        return roots
-            .SelectMany(root => Directory.EnumerateFiles(root, "*.pdf", SearchOption.AllDirectories)
-                .Select(file => new { Root = root, File = file }))
-            .Select(x =>
+        var indexService = new PreviousReimbursementIndexService(_workspace);
+        var index = indexService.Load(config);
+        return index.Invoices
+            .Where(row => !IsSubPath(currentInvoiceDir, row.SourcePath))
+            .Select(row => new PreviousInvoiceRow
             {
-                var row = ReadPdf(x.File);
-                return new PreviousInvoiceRow
-                {
-                    Root = x.Root,
-                    SourcePath = row.SourcePath,
-                    Sha256 = row.Sha256,
-                    InvoiceNumber = row.InvoiceNumber,
-                    Amount = row.Amount,
-                    InvoiceDate = row.InvoiceDate,
-                    Vendor = row.Vendor,
-                    Category = row.Category
-                };
+                Root = row.SourceRoot,
+                SourcePath = row.SourcePath,
+                Sha256 = row.Sha256,
+                InvoiceNumber = row.InvoiceNumber,
+                Amount = row.Amount,
+                InvoiceDate = row.InvoiceDate,
+                Vendor = row.Vendor,
+                Category = row.Category
             })
             .ToList();
     }
@@ -392,7 +403,7 @@ public sealed class PdfInvoiceConsolidationService
         var ws = wb.Worksheets.Add("识别问题诊断");
         var headers = new[]
         {
-            "问题类型", "建议处理", "类别", "开票日期", "金额", "发票号", "销售方", "文本长度", "文本片段", "原始PDF"
+            "问题类型", "建议处理", "类别", "开票日期", "金额", "发票号", "购买方", "销售方", "文本长度", "文本片段", "原始PDF"
         };
         WriteHeaders(ws, headers);
         var r = 2;
@@ -406,10 +417,11 @@ public sealed class PdfInvoiceConsolidationService
             ws.Cell(r, 5).Value = row.Amount;
             ws.Cell(r, 5).Style.NumberFormat.Format = "¥#,##0.00";
             ws.Cell(r, 6).Value = row.InvoiceNumber;
-            ws.Cell(r, 7).Value = row.Vendor;
-            ws.Cell(r, 8).Value = row.TextLength;
-            ws.Cell(r, 9).Value = row.TextSample;
-            ws.Cell(r, 10).Value = row.SourcePath;
+            ws.Cell(r, 7).Value = row.BuyerName;
+            ws.Cell(r, 8).Value = row.Vendor;
+            ws.Cell(r, 9).Value = row.TextLength;
+            ws.Cell(r, 10).Value = row.TextSample;
+            ws.Cell(r, 11).Value = row.SourcePath;
             ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = issue.Type == "非发票PDF"
                 ? XLColor.FromHtml("#E5E7EB")
                 : XLColor.FromHtml("#FFF2CC");
@@ -494,7 +506,8 @@ public sealed class PdfInvoiceConsolidationService
     {
         var flags = new List<string>();
         if (row.Category == "滴滴行程单") flags.Add("非发票PDF：滴滴行程单");
-        else if (string.IsNullOrWhiteSpace(row.InvoiceNumber)) flags.Add("发票号未识别");
+        else if (!row.IsCompanyBuyer) flags.Add("非本公司抬头");
+        else if (string.IsNullOrWhiteSpace(row.InvoiceNumber) && row.Category != "高速/通行费") flags.Add("发票号未识别");
         if (row.Amount <= 0) flags.Add("金额未识别");
         if (string.IsNullOrWhiteSpace(row.InvoiceDate)) flags.Add("开票日期未识别");
         if (row.Category == "其他发票") flags.Add("类别待确认");
@@ -504,8 +517,9 @@ public sealed class PdfInvoiceConsolidationService
     private static bool HasRecognitionProblem(PdfInvoiceRow row)
     {
         if (row.Category == "滴滴行程单") return true;
+        if (!row.IsCompanyBuyer) return true;
         if (row.TextLength == 0) return true;
-        if (string.IsNullOrWhiteSpace(row.InvoiceNumber)) return true;
+        if (string.IsNullOrWhiteSpace(row.InvoiceNumber) && row.Category != "高速/通行费") return true;
         if (row.Amount <= 0) return true;
         if (string.IsNullOrWhiteSpace(row.InvoiceDate)) return true;
         if (row.Category == "其他发票") return true;
@@ -550,6 +564,7 @@ public sealed class PdfInvoiceConsolidationService
 
         return Regex.Matches(text, @"(?<!\d)([0-9]{18,24})(?!\d)")
             .Select(m => NormalizeInvoiceNo(m.Groups[1].Value))
+            .Where(v => !LooksLikeNumericTaxId(v))
             .FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "";
     }
 
@@ -576,24 +591,43 @@ public sealed class PdfInvoiceConsolidationService
     {
         var patterns = new[]
         {
-            @"价税合计.{0,80}?[小写）\)]\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"小写\s*[）\)]?\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"共\s*\d+\s*笔.{0,30}?合计\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元",
-            @"合计\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元",
-            @"发票金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"[¥￥]\s*([0-9]+(?:\.[0-9]{1,2})?)"
+            @"([0-9]{1,6}(?:\.[0-9]{1,2})?)元-合并发票文件",
+            @"发票金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)",
+            @"共\s*\d+\s*笔.{0,30}?合计\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)\s*元",
+            @"合计\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)\s*元",
+            @"金额\s*[：:】\]\s]*[¥￥]\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)"
         };
 
         foreach (var pattern in patterns)
         {
             var match = Regex.Match(text, pattern, RegexOptions.Singleline);
-            if (match.Success && decimal.TryParse(match.Groups[1].Value, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount))
+            if (match.Success && TryParseReasonableAmount(match.Groups[1].Value, out var amount))
             {
                 return amount;
             }
         }
+        var currencyAmounts = Regex.Matches(text, @"[¥￥]\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)")
+            .Select(m => TryParseReasonableAmount(m.Groups[1].Value, out var amount) ? amount : 0m)
+            .Where(amount => amount > 0)
+            .ToList();
+        if (currencyAmounts.Count > 0)
+        {
+            return currencyAmounts.Max();
+        }
         return 0m;
+    }
+
+    private static bool TryParseReasonableAmount(string value, out decimal amount)
+    {
+        if (decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out amount)
+            && amount > 0
+            && amount <= 1_000_000m)
+        {
+            return true;
+        }
+
+        amount = 0m;
+        return false;
     }
 
     private static string ExtractVendor(string text)
@@ -626,6 +660,10 @@ public sealed class PdfInvoiceConsolidationService
         {
             return ("非发票PDF", "作为滴滴行程明细/出行依据保留；需另行匹配对应发票或付款记录。");
         }
+        if (!row.IsCompanyBuyer)
+        {
+            return ("非本公司抬头", "不能纳入本公司报销；请归档或标记无效。");
+        }
         if (row.TextLength == 0)
         {
             return ("PDF无可提取文本", "需要OCR或换用原始电子发票PDF/XML。");
@@ -650,6 +688,30 @@ public sealed class PdfInvoiceConsolidationService
         return Regex.Replace(value, @"\s+", "").Trim();
     }
 
+    private static string ExtractBuyerName(string text)
+    {
+        var known = Regex.Match(text, @"购买方名称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})");
+        if (known.Success) return CleanVendor(known.Groups[1].Value);
+
+        var old = Regex.Match(text, @"纳税人识别号[:：]?\s*[0-9A-Z]{15,20}\s+([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})");
+        if (old.Success) return CleanVendor(old.Groups[1].Value);
+
+        return "";
+    }
+
+    private static bool IsCompanyBuyer(string buyerName, string text, AppConfig config)
+    {
+        if (!string.IsNullOrWhiteSpace(config.CompanyTaxId) && text.Contains(config.CompanyTaxId, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (!string.IsNullOrWhiteSpace(config.CompanyName) && text.Contains(config.CompanyName, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        return false;
+    }
+
     private static bool LooksLikeInvoiceTableHeader(string value)
     {
         return ContainsAny(value, "项目名称", "规格型号", "统一社会信用代码", "纳税人识别号", "下载次数", "税率", "征收率", "单价", "金额");
@@ -667,6 +729,11 @@ public sealed class PdfInvoiceConsolidationService
             value = value[..20];
         }
         return value;
+    }
+
+    private static bool LooksLikeNumericTaxId(string value)
+    {
+        return value.Length == 18 && (value.StartsWith("91", StringComparison.Ordinal) || value.StartsWith("92", StringComparison.Ordinal));
     }
 
     private static string Sha256(string path)
@@ -752,6 +819,8 @@ public sealed class PdfInvoiceConsolidationService
         public string InvoiceNumber { get; set; } = "";
         public decimal Amount { get; set; }
         public string InvoiceDate { get; set; } = "";
+        public string BuyerName { get; set; } = "";
+        public bool IsCompanyBuyer { get; set; } = true;
         public string Vendor { get; set; } = "";
         public string Category { get; set; } = "";
         public string MergeGroup { get; set; } = "";

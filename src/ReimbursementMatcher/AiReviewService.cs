@@ -352,6 +352,13 @@ public sealed class NonPdfInvoiceMaintenanceService
                 continue;
             }
 
+            if (LooksLikeKnownNonInvoiceImage(file))
+            {
+                MoveToArchive(invoiceDir, archiveRoot, file, "文件名规则判断为非发票图片或取票页截图，不作为发票文件");
+                archived++;
+                continue;
+            }
+
             if (IsImage(ext))
             {
                 var qr = TryDecodeQr(file);
@@ -372,7 +379,18 @@ public sealed class NonPdfInvoiceMaintenanceService
 
                 if (ai.IsConfigured(config))
                 {
-                    var result = await ai.ReviewImageAsync(config, file, Path.GetRelativePath(invoiceDir, file), ct);
+                    AiReviewResult result;
+                    try
+                    {
+                        result = await ai.ReviewImageAsync(config, file, Path.GetRelativePath(invoiceDir, file), ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        needsReview++;
+                        _log($"图片AI判断失败，保留人工确认：{Path.GetFileName(file)}；{ex.Message}");
+                        continue;
+                    }
+
                     if (result.Decision == "no_invoice" && result.Confidence >= config.Ai.ConfidenceThreshold)
                     {
                         MoveToArchive(invoiceDir, archiveRoot, file, $"AI判断无发票：{result.Reason}");
@@ -410,12 +428,23 @@ public sealed class NonPdfInvoiceMaintenanceService
         return ext is ".png" or ".jpg" or ".jpeg" or ".webp";
     }
 
+    private static bool LooksLikeKnownNonInvoiceImage(string file)
+    {
+        var name = Path.GetFileName(file);
+        return name.Contains("favicon", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("wx_txf", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("34netank", StringComparison.OrdinalIgnoreCase)
+            || name.Contains("开票文件", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsInsideGeneratedDir(string file, string invoiceDir)
     {
         var relative = Path.GetRelativePath(invoiceDir, file).Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
         return relative.StartsWith("二维码取票下载" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
             || relative.Contains($"{Path.DirectorySeparatorChar}非PDF图片清理_", StringComparison.OrdinalIgnoreCase)
-            || relative.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase);
+            || relative.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase)
+            || relative.Contains($"{Path.DirectorySeparatorChar}日期不符发票_", StringComparison.OrdinalIgnoreCase)
+            || relative.Contains($"{Path.DirectorySeparatorChar}_日期不符发票{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string TryDecodeQr(string file)

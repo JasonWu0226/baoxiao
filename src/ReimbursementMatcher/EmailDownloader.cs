@@ -31,7 +31,7 @@ public sealed class EmailDownloader
 
     private static readonly string[] InvoiceUrlHints =
     [
-        "invoice", "fapiao", "fp", "pdf", "download", "ofd", "发票", "下载"
+        "invoice", "einvoice", "fapiao", "fp", "pdf", "download", "ofd", "发票", "下载", "电子发票", "点击下载电子发票", "alipay", "aliyun", "alibaba"
     ];
 
     private static readonly string[] InvoiceMailKeywords =
@@ -255,12 +255,12 @@ public sealed class EmailDownloader
 
             var before = rows.Count(r => r.TryGetValue("file", out var f) && !string.IsNullOrWhiteSpace(f));
 
-            var attachmentRows = await SaveAttachmentsAsync(msg, outputDir, prefix, subject, sender, date, ids[i].ToString(), messageKey, config.Email.Start, existingHashes, existingPdfKeys, processingStore, ct);
+            var attachmentRows = await SaveAttachmentsAsync(msg, outputDir, prefix, subject, sender, date, ids[i].ToString(), messageKey, config.Email.Start, existingHashes, existingPdfKeys, processingStore, historyService, historyIndex, ct);
             AttachMessageKey(attachmentRows, messageKey);
             rows.AddRange(attachmentRows);
             var linkRows = HasResolvedInvoiceFromAttachments(attachmentRows)
                 ? BuildSkippedLinkRows(links, date, subject, sender, ids[i].ToString(), messageKey)
-                : await DownloadLinksAsync(links, http, outputDir, prefix, subject, sender, date, ids[i].ToString(), messageKey, config.Email.Start, existingHashes, existingPdfKeys, processingStore, ct);
+                : await DownloadLinksAsync(links, http, outputDir, prefix, subject, sender, date, ids[i].ToString(), messageKey, config.Email.Start, existingHashes, existingPdfKeys, processingStore, historyService, historyIndex, ct);
             AttachMessageKey(linkRows, messageKey);
             rows.AddRange(linkRows);
 
@@ -522,7 +522,9 @@ public sealed class EmailDownloader
         string url,
         string startDate,
         EmailProcessingStore processingStore,
-        Dictionary<string, string> existingHashes)
+        Dictionary<string, string> existingHashes,
+        PreviousReimbursementIndexService historyService,
+        PreviousReimbursementIndex historyIndex)
     {
         var metadata = File.Exists(save.Path) ? ExtractInvoiceMetadata(save.Path) : new InvoiceMetadata();
         var row = new Dictionary<string, string>
@@ -569,6 +571,22 @@ public sealed class EmailDownloader
             row["download_status"] = "日期不符已忽略";
             row["error"] = AppendReason(row.GetValueOrDefault("error", ""), $"发票日期 {metadata.Date} 早于开始时间 {startDate}");
             row["duplicate_of"] = archived;
+            row["file"] = "";
+            return row;
+        }
+
+        var previousMatch = historyService.MatchInvoiceNumber(historyIndex, metadata.InvoiceNumber);
+        if (previousMatch.IsMatch)
+        {
+            existingHashes.Remove(save.Sha256);
+            TryDelete(save.Path);
+            row["status"] = "疑似上期已报销跳过";
+            row["download_status"] = "上期已报销跳过";
+            row["error"] = previousMatch.Summary;
+            row["duplicate_of"] = previousMatch.SourcePath;
+            row["historical_match_type"] = previousMatch.MatchType;
+            row["historical_match_summary"] = previousMatch.Summary;
+            row["historical_match_file"] = previousMatch.SourcePath;
             row["file"] = "";
             return row;
         }
@@ -815,6 +833,8 @@ public sealed class EmailDownloader
         Dictionary<string, string> existingHashes,
         HashSet<string> existingPdfKeys,
         EmailProcessingStore processingStore,
+        PreviousReimbursementIndexService historyService,
+        PreviousReimbursementIndex historyIndex,
         CancellationToken ct)
     {
         var rows = new List<Dictionary<string, string>>();
@@ -856,10 +876,10 @@ public sealed class EmailDownloader
                 existingPdfKeys.Add(invoiceKey);
             }
 
-            var row = SavedFileRow("attachment", save, date, subject, sender, msgId, messageKey, "", startDate, processingStore, existingHashes);
+            var row = SavedFileRow("attachment", save, date, subject, sender, msgId, messageKey, "", startDate, processingStore, existingHashes, historyService, historyIndex);
             rows.Add(row);
 
-            rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, ct));
+            rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, historyService, historyIndex, ct));
         }
         return rows;
     }
@@ -878,6 +898,8 @@ public sealed class EmailDownloader
         Dictionary<string, string> existingHashes,
         HashSet<string> existingPdfKeys,
         EmailProcessingStore processingStore,
+        PreviousReimbursementIndexService historyService,
+        PreviousReimbursementIndex historyIndex,
         CancellationToken ct)
     {
         var rows = new List<Dictionary<string, string>>();
@@ -920,6 +942,8 @@ public sealed class EmailDownloader
                         existingHashes,
                         existingPdfKeys,
                         processingStore,
+                        historyService,
+                        historyIndex,
                         ct);
                     rows.AddRange(parsedRows);
                     if (parsedRows.Count == 0)
@@ -943,11 +967,11 @@ public sealed class EmailDownloader
                     existingPdfKeys.Add(invoiceKey);
                 }
 
-                var row = SavedFileRow("link", save, date, subject, sender, msgId, messageKey, url, startDate, processingStore, existingHashes);
+                var row = SavedFileRow("link", save, date, subject, sender, msgId, messageKey, url, startDate, processingStore, existingHashes, historyService, historyIndex);
                 row["content_type"] = contentType;
                 rows.Add(row);
 
-                rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, ct));
+                rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, historyService, historyIndex, ct));
             }
             catch (Exception ex)
             {
@@ -997,6 +1021,8 @@ public sealed class EmailDownloader
         Dictionary<string, string> existingHashes,
         HashSet<string> existingPdfKeys,
         EmailProcessingStore processingStore,
+        PreviousReimbursementIndexService historyService,
+        PreviousReimbursementIndex historyIndex,
         CancellationToken ct)
     {
         var rows = new List<Dictionary<string, string>>();
@@ -1048,14 +1074,14 @@ public sealed class EmailDownloader
                     existingPdfKeys.Add(invoiceKey);
                 }
 
-                var row = SavedFileRow("link_page_candidate", save, date, subject, sender, msgId, messageKey, candidate.Url, startDate, processingStore, existingHashes);
+                var row = SavedFileRow("link_page_candidate", save, date, subject, sender, msgId, messageKey, candidate.Url, startDate, processingStore, existingHashes, historyService, historyIndex);
                 row["status"] = row.GetValueOrDefault("status") == "已下载" ? "页面解析已下载" : row.GetValueOrDefault("status", "");
                 row["source_url"] = originalUrl;
                 row["content_type"] = contentType;
                 row["link_text"] = candidate.Text;
                 rows.Add(row);
 
-                rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, ct));
+                rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, historyService, historyIndex, ct));
             }
             catch (Exception ex)
             {
@@ -1126,7 +1152,7 @@ public sealed class EmailDownloader
     private static bool LooksLikeDownloadCandidate(LinkCandidate candidate)
     {
         var text = $"{candidate.Url} {candidate.Text}";
-        return ContainsAny(text, ".pdf", ".ofd", ".xml", ".zip", "download", "invoice", "fapiao", "发票", "下载", "pdf", "ofd");
+        return ContainsAny(text, ".pdf", ".ofd", ".xml", ".zip", "download", "invoice", "einvoice", "fapiao", "发票", "电子发票", "点击下载电子发票", "下载", "pdf", "ofd");
     }
 
     private static List<LinkCandidate> ExtractLinks(MimeMessage msg)
@@ -1515,6 +1541,8 @@ public sealed class EmailDownloader
         Dictionary<string, string> existingHashes,
         HashSet<string> existingPdfKeys,
         EmailProcessingStore processingStore,
+        PreviousReimbursementIndexService historyService,
+        PreviousReimbursementIndex historyIndex,
         CancellationToken ct)
     {
         var rows = new List<Dictionary<string, string>>();
@@ -1551,7 +1579,7 @@ public sealed class EmailDownloader
                 {
                     existingPdfKeys.Add(invoiceKey);
                 }
-                rows.Add(SavedFileRow("zip_entry", save, date, subject, sender, msgId, messageKey, path, startDate, processingStore, existingHashes));
+                rows.Add(SavedFileRow("zip_entry", save, date, subject, sender, msgId, messageKey, path, startDate, processingStore, existingHashes, historyService, historyIndex));
             }
         }
         catch (Exception ex)

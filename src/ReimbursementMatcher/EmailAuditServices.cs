@@ -63,6 +63,8 @@ public sealed class EmailAuditService
 
         var rows = ReadCsv(latest);
         var processingStore = LoadProcessingStore(config);
+        var previousService = new PreviousReimbursementIndexService(_workspace);
+        var previousIndex = previousService.Load(config);
         var messageKeyById = rows
             .Where(r => Get(r, "kind") == "message")
             .Select(r => new { Id = Get(r, "msg_id"), Key = Get(r, "message_key") })
@@ -72,7 +74,7 @@ public sealed class EmailAuditService
 
         return rows
             .GroupBy(r => GroupKey(r, messageKeyById), StringComparer.OrdinalIgnoreCase)
-            .Select(g => BuildItem(g.Key, g.ToList(), decisions, processingStore.Messages.GetValueOrDefault(g.Key)))
+            .Select(g => BuildItem(g.Key, g.ToList(), decisions, processingStore.Messages.GetValueOrDefault(g.Key), previousService, previousIndex))
             .OrderByDescending(i => i.NeedsHumanReview)
             .ThenBy(i => i.Date)
             .ThenBy(i => i.Subject)
@@ -255,7 +257,13 @@ public sealed class EmailAuditService
         return FirstNonEmpty(Get(row, "subject"), Guid.NewGuid().ToString("N"));
     }
 
-    private static EmailAuditItem BuildItem(string key, List<Dictionary<string, string>> rows, EmailDecisionStore decisions, EmailProcessingRecord? historical)
+    private static EmailAuditItem BuildItem(
+        string key,
+        List<Dictionary<string, string>> rows,
+        EmailDecisionStore decisions,
+        EmailProcessingRecord? historical,
+        PreviousReimbursementIndexService previousService,
+        PreviousReimbursementIndex previousIndex)
     {
         var subject = TextEncodingFixer.Fix(rows.Select(r => Get(r, "subject")).FirstOrDefault(s => !string.IsNullOrWhiteSpace(s)) ?? historical?.Subject ?? "");
         var status = rows.Where(r => Get(r, "kind") == "message").Select(r => Get(r, "status")).FirstOrDefault(s => !string.IsNullOrWhiteSpace(s))
@@ -291,6 +299,31 @@ public sealed class EmailAuditService
         var historicalFile = FirstNonEmpty(
             rows.Select(r => Get(r, "historical_match_file")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
             historical?.HistoricalMatchFile ?? "");
+        if (string.IsNullOrWhiteSpace(historicalMatch))
+        {
+            var byInvoiceNumber = rows.Select(r => Get(r, "invoice_number"))
+                .Concat(historical?.SavedFiles.Select(f => f.InvoiceNumber) ?? [])
+                .Where(v => !string.IsNullOrWhiteSpace(v))
+                .Select(v => previousService.MatchInvoiceNumber(previousIndex, v))
+                .FirstOrDefault(m => m.IsMatch);
+            if (byInvoiceNumber?.IsMatch == true)
+            {
+                historicalMatch = byInvoiceNumber.Summary;
+                historicalFile = byInvoiceNumber.SourcePath;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(historicalMatch))
+        {
+            var byFile = files
+                .Where(File.Exists)
+                .Select(v => previousService.MatchFile(previousIndex, v))
+                .FirstOrDefault(m => m.IsMatch);
+            if (byFile?.IsMatch == true)
+            {
+                historicalMatch = byFile.Summary;
+                historicalFile = byFile.SourcePath;
+            }
+        }
         var ruleDecision = !string.IsNullOrWhiteSpace(historicalMatch)
             ? PreviousReimbursed
             : DecideByRule(hasInvoiceKeyword, hasPlatform, attachmentCount, likelyAttachment, hasLikelyLink, hasAnyLink, downloaded, skipped, hasRiskStatus, errors.Count, statusSet);

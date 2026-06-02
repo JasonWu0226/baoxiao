@@ -1,5 +1,7 @@
 using System.Globalization;
+using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -32,15 +34,19 @@ public sealed class PreviousReimbursementIndexService
             throw new DirectoryNotFoundException("没有找到上期报销目录。可以在“上期发票目录”填写，或把材料放到 报销准备的资料/上一期报销。");
         }
 
-        var documents = roots
+        var archiveRoots = roots.SelectMany(root => ExtractArchivesForIndex(config, root)).ToList();
+        var scanRoots = roots.Concat(archiveRoots).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        var documents = scanRoots
             .SelectMany(root => EnumerateFilesSafe(root, "*.*")
                 .Where(IsPreviousDocument)
                 .Select(file => BuildDocument(root, file)))
             .OrderBy(d => d.SourcePath, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var invoices = roots
-            .SelectMany(root => EnumerateFilesSafe(root, "*.pdf")
+        var invoices = scanRoots
+            .SelectMany(root => EnumerateFilesSafe(root, "*.*")
+                .Where(IsInvoiceFileForIndex)
                 .Select(file => BuildInvoice(root, file, documents)))
             .GroupBy(InvoiceDedupeKey, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.OrderByDescending(i => i.InvoiceNumber.Length)
@@ -55,7 +61,7 @@ public sealed class PreviousReimbursementIndexService
         var index = new PreviousReimbursementIndex
         {
             UpdatedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
-            SourceRoots = roots,
+            SourceRoots = scanRoots,
             Invoices = invoices,
             Documents = documents
         };
@@ -150,6 +156,31 @@ public sealed class PreviousReimbursementIndexService
         return new PreviousReimbursementMatch();
     }
 
+    public PreviousReimbursementMatch MatchInvoiceNumber(PreviousReimbursementIndex index, string invoiceNumber)
+    {
+        if (index.Invoices.Count == 0 || string.IsNullOrWhiteSpace(invoiceNumber))
+        {
+            return new PreviousReimbursementMatch();
+        }
+
+        var normalized = NormalizeInvoiceNo(invoiceNumber);
+        var invoice = index.Invoices.FirstOrDefault(i => i.InvoiceNumber.Equals(normalized, StringComparison.OrdinalIgnoreCase));
+        return invoice == null
+            ? new PreviousReimbursementMatch()
+            : BuildMatch("发票号命中上期索引", 100, invoice);
+    }
+
+    public PreviousReimbursementMatch MatchFile(PreviousReimbursementIndex index, string file)
+    {
+        if (index.Invoices.Count == 0 || string.IsNullOrWhiteSpace(file) || !File.Exists(file))
+        {
+            return new PreviousReimbursementMatch();
+        }
+
+        var invoiceNumber = ExtractInvoiceNo($"{Path.GetFileName(file)} {ExtractPdfText(file)}");
+        return MatchInvoiceNumber(index, invoiceNumber);
+    }
+
     public IEnumerable<string> FindPreviousRoots(AppConfig config)
     {
         var explicitRoots = config.PreviousInvoiceDirs
@@ -185,7 +216,7 @@ public sealed class PreviousReimbursementIndexService
 
     private static PreviousReimbursementInvoice BuildInvoice(string root, string path, List<PreviousReimbursementDocument> documents)
     {
-        var text = ExtractPdfText(path);
+        var text = ExtractInvoiceText(path);
         var combined = $"{Path.GetFileName(path)} {path} {text}";
         return new PreviousReimbursementInvoice
         {
@@ -200,6 +231,64 @@ public sealed class PreviousReimbursementIndexService
             Category = DetectCategory(combined),
             RelatedDocument = FindRelatedDocument(path, documents)
         };
+    }
+
+    private IEnumerable<string> ExtractArchivesForIndex(AppConfig config, string root)
+    {
+        var archiveFiles = EnumerateFilesSafe(root, "*.*")
+            .Where(file => Path.GetExtension(file).Equals(".zip", StringComparison.OrdinalIgnoreCase)
+                || Path.GetExtension(file).Equals(".rar", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        if (archiveFiles.Count == 0)
+        {
+            return [];
+        }
+
+        var cacheRoot = _workspace.Resolve(Path.Combine(config.RuleDir, "上期压缩包解压缓存"));
+        Directory.CreateDirectory(cacheRoot);
+        var extracted = new List<string>();
+        foreach (var archive in archiveFiles)
+        {
+            var hash = Sha256(archive);
+            if (string.IsNullOrWhiteSpace(hash))
+            {
+                continue;
+            }
+
+            var target = Path.Combine(cacheRoot, hash[..Math.Min(16, hash.Length)]);
+            if (!Directory.Exists(target) || !Directory.EnumerateFiles(target, "*.pdf", SearchOption.AllDirectories).Any())
+            {
+                Directory.CreateDirectory(target);
+                TryExtractArchive(archive, target);
+            }
+            if (Directory.Exists(target) && Directory.EnumerateFiles(target, "*.pdf", SearchOption.AllDirectories).Any())
+            {
+                extracted.Add(target);
+            }
+        }
+        return extracted;
+    }
+
+    private static void TryExtractArchive(string archive, string target)
+    {
+        try
+        {
+            var start = new ProcessStartInfo
+            {
+                FileName = "tar",
+                Arguments = $"-xf \"{archive}\" -C \"{target}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            using var process = Process.Start(start);
+            process?.WaitForExit(15000);
+        }
+        catch
+        {
+            // Archive extraction is best-effort. Already extracted folders are still scanned.
+        }
     }
 
     private static PreviousReimbursementDocument BuildDocument(string root, string path)
@@ -354,6 +443,14 @@ public sealed class PreviousReimbursementIndexService
             || ext.Equals(".doc", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsInvoiceFileForIndex(string file)
+    {
+        var ext = Path.GetExtension(file);
+        return ext.Equals(".pdf", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".ofd", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".xml", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsPreviousMaterialDir(string name)
     {
         return ContainsAny(name, "上一期", "上期", "历史", "已报销", "往期", "上次报销", "前期报销");
@@ -364,6 +461,10 @@ public sealed class PreviousReimbursementIndexService
         try
         {
             return Directory.EnumerateFiles(dir, "*.pdf", SearchOption.AllDirectories).Any()
+                || Directory.EnumerateFiles(dir, "*.ofd", SearchOption.AllDirectories).Any()
+                || Directory.EnumerateFiles(dir, "*.xml", SearchOption.AllDirectories).Any()
+                || Directory.EnumerateFiles(dir, "*.zip", SearchOption.AllDirectories).Any()
+                || Directory.EnumerateFiles(dir, "*.rar", SearchOption.AllDirectories).Any()
                 || Directory.EnumerateFiles(dir, "*.xlsx", SearchOption.AllDirectories).Any();
         }
         catch
@@ -397,16 +498,80 @@ public sealed class PreviousReimbursementIndexService
         }
     }
 
+    private static string ExtractInvoiceText(string path)
+    {
+        var ext = Path.GetExtension(path);
+        if (ext.Equals(".pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return ExtractPdfText(path);
+        }
+
+        if (ext.Equals(".xml", StringComparison.OrdinalIgnoreCase))
+        {
+            return ReadTextFile(path);
+        }
+
+        if (ext.Equals(".ofd", StringComparison.OrdinalIgnoreCase))
+        {
+            return ExtractOfdText(path);
+        }
+
+        return "";
+    }
+
+    private static string ReadTextFile(string path)
+    {
+        try
+        {
+            var bytes = File.ReadAllBytes(path);
+            var utf8 = Encoding.UTF8.GetString(bytes);
+            return TextEncodingFixer.Fix(Regex.Replace(utf8, @"\s+", " "));
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string ExtractOfdText(string path)
+    {
+        try
+        {
+            using var stream = File.OpenRead(path);
+            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+            var builder = new StringBuilder();
+            foreach (var entry in archive.Entries
+                .Where(e => e.FullName.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                .Take(30))
+            {
+                using var entryStream = entry.Open();
+                using var reader = new StreamReader(entryStream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+                builder.Append(' ').Append(reader.ReadToEnd());
+            }
+            return TextEncodingFixer.Fix(Regex.Replace(builder.ToString(), "<[^>]+>", " "));
+        }
+        catch
+        {
+            return ReadTextFile(path);
+        }
+    }
+
     private static List<string> ExtractInvoiceNumbers(string text)
     {
         var numbers = new List<string>();
         var labeled = Regex.Matches(text, @"(?:发票号码|发票号|电子发票号码|EIid|InvoiceNumber)[_：:\s-]*([0-9]{8,30})", RegexOptions.IgnoreCase);
         numbers.AddRange(labeled.Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
+        numbers.AddRange(Regex.Matches(text, @"(?<!\d)([0-9]{10,12})\s+([0-9]{8})(?!\d)")
+            .Select(m => NormalizeInvoiceNo(m.Groups[1].Value + m.Groups[2].Value)));
         var dzfp = Regex.Matches(text, @"dzfp[_-]([0-9]{12,30})", RegexOptions.IgnoreCase);
         numbers.AddRange(dzfp.Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
         numbers.AddRange(Regex.Matches(text, @"(?<!\d)([0-9]{18,24})(?!\d)")
             .Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
-        return numbers.Where(v => !string.IsNullOrWhiteSpace(v)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return numbers
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Where(v => !LooksLikeNumericTaxId(v))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     private static string ExtractInvoiceNo(string text)
@@ -421,6 +586,11 @@ public sealed class PreviousReimbursementIndexService
             value = value[..20];
         }
         return value;
+    }
+
+    private static bool LooksLikeNumericTaxId(string value)
+    {
+        return value.Length == 18 && (value.StartsWith("91", StringComparison.Ordinal) || value.StartsWith("92", StringComparison.Ordinal));
     }
 
     private static string ExtractDate(string text)
@@ -446,22 +616,43 @@ public sealed class PreviousReimbursementIndexService
     {
         var patterns = new[]
         {
-            @"价税合计.{0,80}?[小写）\)]\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"小写\s*[）\)]?\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"发票金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
-            @"[¥￥]\s*([0-9]+(?:\.[0-9]{1,2})?)"
+            @"([0-9]{1,6}(?:\.[0-9]{1,2})?)元-合并发票文件",
+            @"发票金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)",
+            @"共\s*\d+\s*笔.{0,30}?合计\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)\s*元",
+            @"合计\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)\s*元",
+            @"金额\s*[：:】\]\s]*[¥￥]\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)"
         };
 
         foreach (var pattern in patterns)
         {
             var match = Regex.Match(text, pattern, RegexOptions.Singleline);
-            if (match.Success && decimal.TryParse(match.Groups[1].Value, NumberStyles.Number, CultureInfo.InvariantCulture, out var amount))
+            if (match.Success && TryParseReasonableAmount(match.Groups[1].Value, out var amount))
             {
                 return amount;
             }
         }
+        var currencyAmounts = Regex.Matches(text, @"[¥￥]\s*([0-9]{1,6}(?:\.[0-9]{1,2})?)")
+            .Select(m => TryParseReasonableAmount(m.Groups[1].Value, out var amount) ? amount : 0m)
+            .Where(amount => amount > 0)
+            .ToList();
+        if (currencyAmounts.Count > 0)
+        {
+            return currencyAmounts.Max();
+        }
         return 0m;
+    }
+
+    private static bool TryParseReasonableAmount(string value, out decimal amount)
+    {
+        if (decimal.TryParse(value, NumberStyles.Number, CultureInfo.InvariantCulture, out amount)
+            && amount > 0
+            && amount <= 1_000_000m)
+        {
+            return true;
+        }
+
+        amount = 0m;
+        return false;
     }
 
     private static string ExtractVendor(string text)
