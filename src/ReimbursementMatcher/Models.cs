@@ -211,6 +211,9 @@ public sealed class PreviousReimbursementInvoice
     public string Vendor { get; set; } = "";
     public string Category { get; set; } = "";
     public string RelatedDocument { get; set; } = "";
+    public string RecognitionStatus { get; set; } = "";
+    public string RecognitionIssues { get; set; } = "";
+    public string TextStatus { get; set; } = "";
 }
 
 public sealed class PreviousReimbursementDocument

@@ -47,7 +47,7 @@ public sealed class PreviousReimbursementIndexService
         var invoices = scanRoots
             .SelectMany(root => EnumerateFilesSafe(root, "*.*")
                 .Where(IsInvoiceFileForIndex)
-                .Select(file => BuildInvoice(root, file, documents)))
+                .Select(file => BuildInvoice(config, root, file, documents)))
             .GroupBy(InvoiceDedupeKey, StringComparer.OrdinalIgnoreCase)
             .Select(g => g.OrderByDescending(i => i.InvoiceNumber.Length)
                 .ThenByDescending(i => i.Amount)
@@ -214,11 +214,11 @@ public sealed class PreviousReimbursementIndexService
         return roots;
     }
 
-    private static PreviousReimbursementInvoice BuildInvoice(string root, string path, List<PreviousReimbursementDocument> documents)
+    private static PreviousReimbursementInvoice BuildInvoice(AppConfig config, string root, string path, List<PreviousReimbursementDocument> documents)
     {
         var text = ExtractInvoiceText(path);
         var combined = $"{Path.GetFileName(path)} {path} {text}";
-        return new PreviousReimbursementInvoice
+        var invoice = new PreviousReimbursementInvoice
         {
             SourceRoot = root,
             SourcePath = path,
@@ -227,10 +227,13 @@ public sealed class PreviousReimbursementIndexService
             InvoiceNumber = ExtractInvoiceNo(combined),
             Amount = ExtractAmount(combined),
             InvoiceDate = ExtractDate(combined),
-            Vendor = ExtractVendor(combined),
+            Vendor = ExtractVendor(combined, config),
             Category = DetectCategory(combined),
-            RelatedDocument = FindRelatedDocument(path, documents)
+            RelatedDocument = FindRelatedDocument(path, documents),
+            TextStatus = string.IsNullOrWhiteSpace(text) ? "无可提取文本" : $"已提取文本({text.Length})"
         };
+        FillRecognitionStatus(invoice, text);
+        return invoice;
     }
 
     private IEnumerable<string> ExtractArchivesForIndex(AppConfig config, string root)
@@ -346,7 +349,7 @@ public sealed class PreviousReimbursementIndexService
         summary.Columns().AdjustToContents(8, 80);
 
         var invoices = wb.Worksheets.Add("上期发票索引");
-        var invoiceHeaders = new[] { "类别", "开票日期", "金额", "发票号", "销售方", "发票文件", "关联报销文档", "SHA256" };
+        var invoiceHeaders = new[] { "类别", "开票日期", "金额", "发票号", "销售方", "识别状态", "缺失项/原因", "文本状态", "发票文件", "关联报销文档", "SHA256" };
         WriteHeaders(invoices, invoiceHeaders);
         var r = 2;
         foreach (var item in index.Invoices)
@@ -357,9 +360,12 @@ public sealed class PreviousReimbursementIndexService
             invoices.Cell(r, 3).Style.NumberFormat.Format = "¥#,##0.00";
             invoices.Cell(r, 4).Value = item.InvoiceNumber;
             invoices.Cell(r, 5).Value = item.Vendor;
-            invoices.Cell(r, 6).Value = item.SourcePath;
-            invoices.Cell(r, 7).Value = item.RelatedDocument;
-            invoices.Cell(r, 8).Value = item.Sha256;
+            invoices.Cell(r, 6).Value = item.RecognitionStatus;
+            invoices.Cell(r, 7).Value = item.RecognitionIssues;
+            invoices.Cell(r, 8).Value = item.TextStatus;
+            invoices.Cell(r, 9).Value = item.SourcePath;
+            invoices.Cell(r, 10).Value = item.RelatedDocument;
+            invoices.Cell(r, 11).Value = item.Sha256;
             r++;
         }
         FormatSheet(invoices, invoiceHeaders.Length);
@@ -680,7 +686,45 @@ public sealed class PreviousReimbursementIndexService
         return false;
     }
 
-    private static string ExtractVendor(string text)
+    private static void FillRecognitionStatus(PreviousReimbursementInvoice invoice, string extractedText)
+    {
+        var issues = new List<string>();
+        if (string.IsNullOrWhiteSpace(extractedText))
+        {
+            issues.Add("PDF无可提取文本/可能是扫描件");
+        }
+
+        if (string.IsNullOrWhiteSpace(invoice.InvoiceNumber))
+        {
+            issues.Add("缺发票号");
+        }
+
+        if (string.IsNullOrWhiteSpace(invoice.InvoiceDate))
+        {
+            issues.Add("缺开票日期");
+        }
+
+        if (invoice.Amount <= 0)
+        {
+            issues.Add("缺金额");
+        }
+
+        if (string.IsNullOrWhiteSpace(invoice.Vendor))
+        {
+            issues.Add("缺销售方");
+        }
+
+        if (invoice.FileName.Contains("合并发票", StringComparison.OrdinalIgnoreCase)
+            || Regex.IsMatch(invoice.FileName, @"\d+张-\d", RegexOptions.IgnoreCase))
+        {
+            issues.Add("合并发票文件，建议按单张明细核验");
+        }
+
+        invoice.RecognitionIssues = string.Join("；", issues.Distinct());
+        invoice.RecognitionStatus = issues.Count == 0 ? "完整" : "需复核";
+    }
+
+    private static string ExtractVendor(string text, AppConfig config)
     {
         var patterns = new[]
         {
@@ -696,7 +740,7 @@ public sealed class PreviousReimbursementIndexService
             var match = Regex.Match(text, pattern, RegexOptions.Singleline | RegexOptions.IgnoreCase);
             if (match.Success)
             {
-                var value = CleanVendor(match.Groups[1].Value);
+                var value = NormalizeVendorCandidate(match.Groups[1].Value, config);
                 if (LooksLikeValidVendor(value))
                 {
                     return value;
@@ -704,10 +748,22 @@ public sealed class PreviousReimbursementIndexService
             }
         }
 
+        var valueFromCompanyName = ExtractNeighborVendorByCompanyName(text, config);
+        if (LooksLikeValidVendor(valueFromCompanyName))
+        {
+            return valueFromCompanyName;
+        }
+
+        var valueFromTaxId = ExtractNeighborVendorByCompanyTaxId(text, config);
+        if (LooksLikeValidVendor(valueFromTaxId))
+        {
+            return valueFromTaxId;
+        }
+
         var fileNameVendor = Regex.Match(text, @"[0-9]+(?:\.[0-9]{1,2})?元-([^-\\/:]{4,60}?)-20\d{2}[._-]?\d{1,2}", RegexOptions.Singleline);
         if (fileNameVendor.Success)
         {
-            var value = CleanVendor(fileNameVendor.Groups[1].Value);
+            var value = NormalizeVendorCandidate(fileNameVendor.Groups[1].Value, config);
             if (LooksLikeValidVendor(value))
             {
                 return value;
@@ -716,10 +772,112 @@ public sealed class PreviousReimbursementIndexService
 
         var name = Path.GetFileNameWithoutExtension(text);
         var parts = Regex.Split(name, @"[_\s]+").Where(p => p.Length >= 4).ToList();
-        return parts.FirstOrDefault(p =>
-            p.Any(ch => ch >= '\u4e00' && ch <= '\u9fff')
-            && LooksLikeValidVendor(p)
-            && p.Length <= 40) ?? "";
+        return parts
+            .Select(p => NormalizeVendorCandidate(p, config))
+            .FirstOrDefault(p =>
+                p.Any(ch => ch >= '\u4e00' && ch <= '\u9fff')
+                && LooksLikeValidVendor(p)
+                && p.Length <= 40) ?? "";
+    }
+
+    private static string ExtractNeighborVendorByCompanyName(string text, AppConfig config)
+    {
+        var companyName = CleanVendor(config.CompanyName);
+        if (string.IsNullOrWhiteSpace(companyName) || !text.Contains(companyName, StringComparison.OrdinalIgnoreCase))
+        {
+            return "";
+        }
+
+        var escaped = Regex.Escape(companyName);
+        var match = Regex.Match(text, escaped + @"(?<vendor>[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}?)(?:9[0-9A-Z]{14,19}|[¥￥]|[*＊]|合计|价税合计|下载次数)", RegexOptions.Singleline);
+        if (match.Success)
+        {
+            var value = NormalizeVendorCandidate(match.Groups["vendor"].Value, config);
+            if (LooksLikeValidVendor(value))
+            {
+                return value;
+            }
+        }
+
+        match = Regex.Match(text, escaped + @"(?<tail>.{0,160})", RegexOptions.Singleline);
+        if (match.Success)
+        {
+            foreach (var value in ExtractCompanyLikeNames(match.Groups["tail"].Value, config))
+            {
+                if (!value.Equals(companyName, StringComparison.OrdinalIgnoreCase) && LooksLikeValidVendor(value))
+                {
+                    return value;
+                }
+            }
+        }
+
+        return "";
+    }
+
+    private static string ExtractNeighborVendorByCompanyTaxId(string text, AppConfig config)
+    {
+        var companyTaxId = Regex.Replace(config.CompanyTaxId ?? "", @"[^0-9A-Z]", "", RegexOptions.IgnoreCase).ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(companyTaxId) || !text.Contains(companyTaxId, StringComparison.OrdinalIgnoreCase))
+        {
+            return "";
+        }
+
+        var escaped = Regex.Escape(companyTaxId);
+        var match = Regex.Match(text, escaped + @"(?<vendor>[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}?)(?:9[0-9A-Z]{14,19}|[¥￥]|[*＊]|合计|价税合计|下载次数)", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        if (match.Success)
+        {
+            var value = NormalizeVendorCandidate(match.Groups["vendor"].Value, config);
+            if (LooksLikeValidVendor(value))
+            {
+                return value;
+            }
+        }
+
+        match = Regex.Match(text, @"(?<head>.{0,120})" + escaped, RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        if (match.Success)
+        {
+            var candidates = ExtractCompanyLikeNames(match.Groups["head"].Value, config).ToList();
+            if (candidates.Count > 0)
+            {
+                var value = candidates.Last();
+                if (LooksLikeValidVendor(value))
+                {
+                    return value;
+                }
+            }
+        }
+
+        return "";
+    }
+
+    private static IEnumerable<string> ExtractCompanyLikeNames(string text, AppConfig config)
+    {
+        return Regex.Matches(text, @"[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9（）()·\-]{1,59}(?:有限公司|分公司|公司|餐饮服务有限公司|餐饮店|旅馆|酒店|宾馆|烧烤店|商贸有限公司|科技有限公司|高速公路有限公司|路桥投资建设有限公司|服务区)")
+            .Select(m => NormalizeVendorCandidate(m.Value, config))
+            .Where(LooksLikeValidVendor)
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeVendorCandidate(string value, AppConfig config)
+    {
+        value = CleanVendor(value);
+        var companyName = CleanVendor(config.CompanyName);
+        var companyTaxId = Regex.Replace(config.CompanyTaxId ?? "", @"[^0-9A-Z]", "", RegexOptions.IgnoreCase).ToUpperInvariant();
+
+        if (!string.IsNullOrWhiteSpace(companyTaxId))
+        {
+            value = Regex.Replace(value, Regex.Escape(companyTaxId), "", RegexOptions.IgnoreCase);
+        }
+
+        if (!string.IsNullOrWhiteSpace(companyName) && value.Contains(companyName, StringComparison.OrdinalIgnoreCase))
+        {
+            value = value.Replace(companyName, "", StringComparison.OrdinalIgnoreCase);
+        }
+
+        value = Regex.Replace(value, @"^(?:20\d{2})?年?\d{1,2}月\d{1,2}日", "");
+        value = Regex.Replace(value, @"^[0-9A-Z]{15,}", "", RegexOptions.IgnoreCase);
+        value = Regex.Replace(value, @"^\d{8,}", "");
+        return CleanVendor(value);
     }
 
     private static string CleanVendor(string value)
@@ -747,7 +905,7 @@ public sealed class PreviousReimbursementIndexService
 
         return ContainsAny(value,
             "公司", "分公司", "有限公司", "商贸", "科技", "餐", "饭", "酒店", "宾馆", "烧烤",
-            "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店");
+            "旅馆", "住宿", "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店");
     }
 
     private static bool LooksLikeVendorNoise(string value)
@@ -755,6 +913,11 @@ public sealed class PreviousReimbursementIndexService
         if (ContainsAny(value, ":", "：", ";", "；", "项目名称", "规格型号", "统一社会信用代码", "纳税人识别号",
             "下载次数", "税率", "征收率", "单价", "金额", "发票代码", "发票号码", "开票日期", "银行账号", "账号",
             "复核人", "开票人", "收款人", "机器编号", "校验码", "电子支付标识", "密码区", "电话", "地址", "车牌号"))
+        {
+            return true;
+        }
+
+        if (Regex.IsMatch(value, @"[0-9A-Z]{15,}|\d{8,}|20\d{2}年", RegexOptions.IgnoreCase))
         {
             return true;
         }
