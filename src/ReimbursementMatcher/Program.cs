@@ -87,6 +87,12 @@ static class Program
             Console.WriteLine($"已归档非PDF重复格式文件：{moved}");
             return;
         }
+        if (arg == "--consolidate-pdf-invoices")
+        {
+            var output = new PdfInvoiceConsolidationService(workspace).Generate(config);
+            Console.WriteLine(output);
+            return;
+        }
         if (arg == "--process-nonpdf-qr")
         {
             var output = new NonPdfInvoiceMaintenanceService(workspace, Console.WriteLine)

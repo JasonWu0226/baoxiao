@@ -11,6 +11,7 @@ public partial class Form1 : Form
     private readonly ConfirmationService _confirmations;
     private readonly ReportService _reporter;
     private readonly InvoiceFileCleaner _invoiceCleaner;
+    private readonly PdfInvoiceConsolidationService _pdfConsolidation;
     private readonly NonPdfInvoiceMaintenanceService _nonPdfMaintenance;
     private readonly AiReviewService _aiReviewService;
     private readonly EmailAuditReportService _emailAuditReporter;
@@ -87,6 +88,7 @@ public partial class Form1 : Form
         _confirmations = new ConfirmationService(_workspace);
         _reporter = new ReportService(_workspace);
         _invoiceCleaner = new InvoiceFileCleaner(_workspace);
+        _pdfConsolidation = new PdfInvoiceConsolidationService(_workspace);
         _nonPdfMaintenance = new NonPdfInvoiceMaintenanceService(_workspace, Log);
         _aiReviewService = new AiReviewService(_workspace, Log);
         _emailAuditReporter = new EmailAuditReportService(_workspace);
@@ -248,6 +250,7 @@ public partial class Form1 : Form
         buttons.Controls.Add(Button("生成邮件统计Excel", (_, _) => GenerateEmailAuditReport()));
         buttons.Controls.Add(Button("打开清单目录", (_, _) => OpenDir(_config.Email.OutputDir)));
         buttons.Controls.Add(Button("归档非PDF重复格式", (_, _) => ArchiveNonPdfInvoiceFormats()));
+        buttons.Controls.Add(Button("归集PDF发票并汇总", (_, _) => ConsolidatePdfInvoices()));
         buttons.Controls.Add(Button("处理非PDF/二维码/AI判断", async (s, _) => await ProcessNonPdfAndQrAsync(s as Button)));
         buttons.Controls.Add(new Label
         {
@@ -1143,6 +1146,23 @@ public partial class Form1 : Form
         Log($"已归档非PDF重复格式文件：{moved} 个。");
         ScanMaterials();
         MessageBox.Show($"已归档 {moved} 个同一发票已有 PDF 的非 PDF 格式文件。", "归档完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void ConsolidatePdfInvoices()
+    {
+        SaveConfig();
+        try
+        {
+            var output = _pdfConsolidation.Generate(_config);
+            Log($"已归集PDF发票并生成汇总表：{output}");
+            Process.Start(new ProcessStartInfo(output) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            var message = ErrorText(ex);
+            Log("归集PDF发票失败：" + message);
+            MessageBox.Show(message, "归集PDF发票失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private async Task ProcessNonPdfAndQrAsync(Button? button)
