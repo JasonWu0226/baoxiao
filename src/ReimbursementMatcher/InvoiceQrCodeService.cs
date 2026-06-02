@@ -150,7 +150,11 @@ public static class InvoiceQrCodeService
 
         if (parts.Length >= 4)
         {
-            result.InvoiceNumber = NormalizeInvoiceNo(parts[3]);
+            var invoiceCode = NormalizeInvoiceNo(parts[2]);
+            var invoiceNumber = NormalizeInvoiceNo(parts[3]);
+            result.InvoiceNumber = invoiceCode.Length is >= 10 and <= 12 && invoiceNumber.Length == 8
+                ? invoiceCode + invoiceNumber
+                : invoiceNumber;
         }
 
         if (parts.Length >= 5

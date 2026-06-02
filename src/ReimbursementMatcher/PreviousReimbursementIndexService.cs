@@ -582,6 +582,9 @@ public sealed class PreviousReimbursementIndexService
         numbers.AddRange(Regex.Matches(text, @"(?<!\d)([0-9]{10,12})\s+([0-9]{8})(?!\d)")
             .Select(m => NormalizeInvoiceNo(m.Groups[1].Value + m.Groups[2].Value)));
 
+        numbers.AddRange(Regex.Matches(text, @"([0-9]{20,80})(?=20\d{2}年\d{1,2}月\d{1,2}日)")
+            .Select(m => NormalizeInvoiceNo(m.Groups[1].Value[^20..])));
+
         var dzfp = Regex.Matches(text, @"dzfp[_-]([0-9]{12,30})", RegexOptions.IgnoreCase);
         numbers.AddRange(dzfp.Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
 
@@ -694,6 +697,8 @@ public sealed class PreviousReimbursementIndexService
     private static void FillRecognitionStatus(PreviousReimbursementInvoice invoice, string extractedText)
     {
         var issues = new List<string>();
+        var voucherNote = "非发票类报销凭证，无发票号要求";
+        var isVoucher = IsNonInvoiceReimbursementVoucher(invoice);
         if (string.IsNullOrWhiteSpace(extractedText))
         {
             issues.Add(invoice.TextStatus.Contains("已识别发票二维码", StringComparison.OrdinalIgnoreCase)
@@ -701,7 +706,12 @@ public sealed class PreviousReimbursementIndexService
                 : "PDF无可提取文本/可能是扫描件");
         }
 
-        if (string.IsNullOrWhiteSpace(invoice.InvoiceNumber))
+        if (isVoucher)
+        {
+            issues.Add(voucherNote);
+        }
+
+        if (!isVoucher && string.IsNullOrWhiteSpace(invoice.InvoiceNumber))
         {
             issues.Add("缺发票号");
         }
@@ -716,7 +726,7 @@ public sealed class PreviousReimbursementIndexService
             issues.Add("缺金额");
         }
 
-        if (string.IsNullOrWhiteSpace(invoice.Vendor))
+        if (!isVoucher && string.IsNullOrWhiteSpace(invoice.Vendor))
         {
             issues.Add("缺销售方");
         }
@@ -728,7 +738,16 @@ public sealed class PreviousReimbursementIndexService
         }
 
         invoice.RecognitionIssues = string.Join("；", issues.Distinct());
-        invoice.RecognitionStatus = issues.Count == 0 ? "完整" : "需复核";
+        invoice.RecognitionStatus = isVoucher && issues.All(i => i == voucherNote)
+            ? "凭证"
+            : issues.Count == 0 ? "完整" : "需复核";
+    }
+
+    private static bool IsNonInvoiceReimbursementVoucher(PreviousReimbursementInvoice invoice)
+    {
+        var text = $"{invoice.FileName} {invoice.Category}";
+        return ContainsAny(text, "行程报销单", "出行行程单", "行程单", "报销凭证")
+            && !invoice.FileName.Contains("发票", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildTextStatus(string text, InvoiceQrMetadata qr)
@@ -754,6 +773,8 @@ public sealed class PreviousReimbursementIndexService
             @"销售方信息.{0,120}?名\s*称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
             @"销售方\s*名\s*称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
             @"销方\s*名\s*称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
+            @"销货方名称[:：]\s*(.{4,100}?)(?:纳税人识别号|地\s*址|开户行|备注|收款人|复核|开票人|销售方|$)",
+            @"销货方名称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80})",
             @"销\s*货\s*方.{0,40}?名\s*称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})",
             @"<[^>]*(?:SellerName|Seller|Xsfmc|XSFMC)[^>]*>\s*([^<]{4,80})\s*</"
         };
@@ -781,6 +802,11 @@ public sealed class PreviousReimbursementIndexService
         if (LooksLikeValidVendor(valueFromTaxId))
         {
             return valueFromTaxId;
+        }
+
+        if (ContainsAny(text, "铁路电子客票", "12306", "中国铁路"))
+        {
+            return "中国铁路";
         }
 
         var fileNameVendor = Regex.Match(text, @"[0-9]+(?:\.[0-9]{1,2})?元-([^-\\/:]{4,60}?)-20\d{2}[._-]?\d{1,2}", RegexOptions.Singleline);
@@ -812,7 +838,7 @@ public sealed class PreviousReimbursementIndexService
         }
 
         var escaped = Regex.Escape(companyName);
-        var match = Regex.Match(text, escaped + @"(?<vendor>[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}?)(?:9[0-9A-Z]{14,19}|[¥￥]|[*＊]|合计|价税合计|下载次数)", RegexOptions.Singleline);
+        var match = Regex.Match(text, escaped + @"(?<vendor>[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}?)(?:[0-9A-Z]{15,20}|[¥￥]|[*＊]|合计|价税合计|下载次数)", RegexOptions.Singleline);
         if (match.Success)
         {
             var value = NormalizeVendorCandidate(match.Groups["vendor"].Value, config);
@@ -846,7 +872,7 @@ public sealed class PreviousReimbursementIndexService
         }
 
         var escaped = Regex.Escape(companyTaxId);
-        var match = Regex.Match(text, escaped + @"(?<vendor>[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}?)(?:9[0-9A-Z]{14,19}|[¥￥]|[*＊]|合计|价税合计|下载次数)", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        var match = Regex.Match(text, escaped + @"(?<vendor>[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}?)(?:[0-9A-Z]{15,20}|[¥￥]|[*＊]|合计|价税合计|下载次数)", RegexOptions.Singleline | RegexOptions.IgnoreCase);
         if (match.Success)
         {
             var value = NormalizeVendorCandidate(match.Groups["vendor"].Value, config);
@@ -875,7 +901,7 @@ public sealed class PreviousReimbursementIndexService
 
     private static IEnumerable<string> ExtractCompanyLikeNames(string text, AppConfig config)
     {
-        return Regex.Matches(text, @"[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9（）()·\-]{1,59}(?:有限公司|分公司|公司|餐饮服务有限公司|餐饮店|旅馆|酒店|宾馆|烧烤店|商贸有限公司|科技有限公司|高速公路有限公司|路桥投资建设有限公司|服务区)")
+        return Regex.Matches(text, @"[\u4e00-\u9fff][\u4e00-\u9fffA-Za-z0-9（）()·\-]{1,59}(?:有限公司|分公司|公司|基金会|服务部|经营部|个体工商户|餐饮服务有限公司|餐饮店|旅馆|酒店|宾馆|烧烤店|商贸有限公司|科技有限公司|高速公路有限公司|路桥投资建设有限公司|服务区)")
             .Select(m => NormalizeVendorCandidate(m.Value, config))
             .Where(LooksLikeValidVendor)
             .Distinct(StringComparer.OrdinalIgnoreCase);
@@ -928,7 +954,8 @@ public sealed class PreviousReimbursementIndexService
 
         return ContainsAny(value,
             "公司", "分公司", "有限公司", "商贸", "科技", "餐", "饭", "酒店", "宾馆", "烧烤",
-            "旅馆", "住宿", "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店");
+            "旅馆", "住宿", "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店",
+            "基金会", "服务部", "经营部", "个体工商户");
     }
 
     private static bool LooksLikeVendorNoise(string value)

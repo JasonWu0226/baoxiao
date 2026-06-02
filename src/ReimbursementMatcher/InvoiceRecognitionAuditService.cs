@@ -399,6 +399,9 @@ public sealed class InvoiceRecognitionAuditService
         numbers.AddRange(Regex.Matches(text, @"(?<!\d)([0-9]{10,12})\s+([0-9]{8})(?!\d)")
             .Select(m => NormalizeInvoiceNo(m.Groups[1].Value + m.Groups[2].Value)));
 
+        numbers.AddRange(Regex.Matches(text, @"([0-9]{20,80})(?=20\d{2}年\d{1,2}月\d{1,2}日)")
+            .Select(m => NormalizeInvoiceNo(m.Groups[1].Value[^20..])));
+
         var dzfp = Regex.Matches(text, @"dzfp[_-]([0-9]{12,30})", RegexOptions.IgnoreCase);
         numbers.AddRange(dzfp.Select(m => NormalizeInvoiceNo(m.Groups[1].Value)));
 
@@ -524,6 +527,8 @@ public sealed class InvoiceRecognitionAuditService
             @"销售方信息.{0,140}?名\s*称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80})",
             @"销售方\s*名\s*称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80})",
             @"销方\s*名\s*称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80})",
+            @"销货方名称[:：]\s*(.{4,100}?)(?:纳税人识别号|地\s*址|开户行|备注|收款人|复核|开票人|销售方|$)",
+            @"销货方名称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80})",
             @"销\s*货\s*方.{0,60}?名\s*称[:：]?\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80})",
             @"<[^>]*(?:SellerName|Seller|Xsfmc|XSFMC)[^>]*>\s*([^<]{4,100})\s*</"
         };
@@ -532,6 +537,11 @@ public sealed class InvoiceRecognitionAuditService
         if (!string.IsNullOrWhiteSpace(value))
         {
             return value;
+        }
+
+        if (ContainsAny(text, "铁路电子客票", "12306", "中国铁路"))
+        {
+            return "中国铁路";
         }
 
         var fileNameVendor = Regex.Match(text, @"[0-9]+(?:\.[0-9]{1,2})?元-([^-\\/:]{4,60}?)-20\d{2}[._-]?\d{1,2}", RegexOptions.Singleline);
@@ -600,7 +610,8 @@ public sealed class InvoiceRecognitionAuditService
         return value.Length is >= 4 and <= 80
             && !LooksLikeNoiseName(value)
             && ContainsAny(value, "公司", "分公司", "有限公司", "商贸", "科技", "餐", "饭", "酒店", "宾馆", "烧烤",
-                "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店", "中心");
+                "餐饮", "高速", "路桥", "服务区", "商行", "商店", "店", "中心",
+                "基金会", "服务部", "经营部", "个体工商户");
     }
 
     private static bool LooksLikeNoiseName(string value)
