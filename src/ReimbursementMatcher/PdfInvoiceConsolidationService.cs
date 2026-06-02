@@ -89,6 +89,7 @@ public sealed class PdfInvoiceConsolidationService
             FileName = Path.GetFileName(path),
             Sha256 = Sha256(path),
             TextLength = text.Length,
+            TextSample = Shorten(text, 500),
             InvoiceNumber = ExtractInvoiceNo(combined),
             Amount = ExtractAmount(combined),
             InvoiceDate = ExtractDate(combined),
@@ -270,6 +271,7 @@ public sealed class PdfInvoiceConsolidationService
         WriteSummarySheet(wb, unique, duplicates, outputRoot);
         WriteInvoiceSheet(wb, "唯一PDF发票", unique);
         WriteInvoiceSheet(wb, "待补充核验", unique.Where(r => !string.IsNullOrWhiteSpace(r.ReviewFlag)).ToList());
+        WriteRecognitionDiagnosticSheet(wb, unique.Where(HasRecognitionProblem).ToList());
         WritePreviousOverlapSheet(wb, unique.Where(r => !string.IsNullOrWhiteSpace(r.PreviousMatch.MatchType)).ToList());
         WriteDuplicateSheet(wb, duplicates);
         WriteMergeSheet(wb, BuildMergeGroups(unique));
@@ -291,7 +293,9 @@ public sealed class PdfInvoiceConsolidationService
             ("高速/通行费数量", unique.Count(r => r.Category == "高速/通行费")),
             ("高速/通行费金额", unique.Where(r => r.Category == "高速/通行费").Sum(r => r.Amount)),
             ("滴滴/网约车数量", unique.Count(r => r.Category == "滴滴/网约车")),
-            ("滴滴/网约车金额", unique.Where(r => r.Category == "滴滴/网约车").Sum(r => r.Amount))
+            ("滴滴/网约车金额", unique.Where(r => r.Category == "滴滴/网约车").Sum(r => r.Amount)),
+            ("滴滴行程单数量", unique.Count(r => r.Category == "滴滴行程单")),
+            ("滴滴行程单金额", unique.Where(r => r.Category == "滴滴行程单").Sum(r => r.Amount))
         };
 
         ws.Cell(1, 1).Value = "指标";
@@ -383,6 +387,37 @@ public sealed class PdfInvoiceConsolidationService
         FormatSheet(ws, headers.Length);
     }
 
+    private static void WriteRecognitionDiagnosticSheet(XLWorkbook wb, List<PdfInvoiceRow> rows)
+    {
+        var ws = wb.Worksheets.Add("识别问题诊断");
+        var headers = new[]
+        {
+            "问题类型", "建议处理", "类别", "开票日期", "金额", "发票号", "销售方", "文本长度", "文本片段", "原始PDF"
+        };
+        WriteHeaders(ws, headers);
+        var r = 2;
+        foreach (var row in rows)
+        {
+            var issue = RecognitionIssue(row);
+            ws.Cell(r, 1).Value = issue.Type;
+            ws.Cell(r, 2).Value = issue.Action;
+            ws.Cell(r, 3).Value = row.Category;
+            ws.Cell(r, 4).Value = row.InvoiceDate;
+            ws.Cell(r, 5).Value = row.Amount;
+            ws.Cell(r, 5).Style.NumberFormat.Format = "¥#,##0.00";
+            ws.Cell(r, 6).Value = row.InvoiceNumber;
+            ws.Cell(r, 7).Value = row.Vendor;
+            ws.Cell(r, 8).Value = row.TextLength;
+            ws.Cell(r, 9).Value = row.TextSample;
+            ws.Cell(r, 10).Value = row.SourcePath;
+            ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = issue.Type == "非发票PDF"
+                ? XLColor.FromHtml("#E5E7EB")
+                : XLColor.FromHtml("#FFF2CC");
+            r++;
+        }
+        FormatSheet(ws, headers.Length);
+    }
+
     private static void WriteDuplicateSheet(XLWorkbook wb, List<PdfInvoiceRow> rows)
     {
         var ws = wb.Worksheets.Add("重复PDF");
@@ -429,7 +464,7 @@ public sealed class PdfInvoiceConsolidationService
     private static List<MergeGroupRow> BuildMergeGroups(List<PdfInvoiceRow> rows)
     {
         return rows
-            .Where(r => r.Category is "高速/通行费" or "滴滴/网约车")
+            .Where(r => r.Category is "高速/通行费" or "滴滴/网约车" or "滴滴行程单")
             .GroupBy(r => new { r.Category, Month = InvoiceMonth(r.InvoiceDate) })
             .Select(g =>
             {
@@ -446,7 +481,7 @@ public sealed class PdfInvoiceConsolidationService
                     DateRange = string.IsNullOrWhiteSpace(minDate) ? "" : $"{minDate} 至 {maxDate}",
                     Summary = g.Key.Category == "高速/通行费"
                         ? $"{g.Key.Month}高速通行费汇总"
-                        : $"{g.Key.Month}滴滴/网约车出行费汇总",
+                        : $"{g.Key.Month}滴滴出行汇总",
                     Files = string.Join(Environment.NewLine, list.Select(r => r.CopiedPath))
                 };
             })
@@ -458,11 +493,23 @@ public sealed class PdfInvoiceConsolidationService
     private static string BuildReviewFlag(PdfInvoiceRow row)
     {
         var flags = new List<string>();
-        if (string.IsNullOrWhiteSpace(row.InvoiceNumber)) flags.Add("发票号未识别");
+        if (row.Category == "滴滴行程单") flags.Add("非发票PDF：滴滴行程单");
+        else if (string.IsNullOrWhiteSpace(row.InvoiceNumber)) flags.Add("发票号未识别");
         if (row.Amount <= 0) flags.Add("金额未识别");
         if (string.IsNullOrWhiteSpace(row.InvoiceDate)) flags.Add("开票日期未识别");
         if (row.Category == "其他发票") flags.Add("类别待确认");
         return string.Join("；", flags);
+    }
+
+    private static bool HasRecognitionProblem(PdfInvoiceRow row)
+    {
+        if (row.Category == "滴滴行程单") return true;
+        if (row.TextLength == 0) return true;
+        if (string.IsNullOrWhiteSpace(row.InvoiceNumber)) return true;
+        if (row.Amount <= 0) return true;
+        if (string.IsNullOrWhiteSpace(row.InvoiceDate)) return true;
+        if (row.Category == "其他发票") return true;
+        return false;
     }
 
     private static string MergeFlag(string left, string right)
@@ -473,7 +520,7 @@ public sealed class PdfInvoiceConsolidationService
 
     private static string BuildMergeGroup(PdfInvoiceRow row)
     {
-        if (row.Category is "高速/通行费" or "滴滴/网约车")
+        if (row.Category is "高速/通行费" or "滴滴/网约车" or "滴滴行程单")
         {
             return $"{InvoiceMonth(row.InvoiceDate)}_{row.Category}";
         }
@@ -483,6 +530,7 @@ public sealed class PdfInvoiceConsolidationService
     private static string DetectCategory(string text)
     {
         if (ContainsAny(text, "通行费", "高速", "ETC", "收费公路", "过路费")) return "高速/通行费";
+        if (ContainsAny(text, "滴滴出行-行程单", "DIDI TRAVEL - TRIP TABLE")) return "滴滴行程单";
         if (ContainsAny(text, "滴滴", "DIDI", "网约车", "出行科技", "小桔")) return "滴滴/网约车";
         if (ContainsAny(text, "铁路", "火车票", "12306", "客票", "行程单")) return "火车/铁路";
         if (ContainsAny(text, "航空", "机票", "航旅", "机场")) return "飞机/机票";
@@ -530,6 +578,8 @@ public sealed class PdfInvoiceConsolidationService
         {
             @"价税合计.{0,80}?[小写）\)]\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
             @"小写\s*[）\)]?\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
+            @"共\s*\d+\s*笔.{0,30}?合计\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元",
+            @"合计\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元",
             @"发票金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
             @"金额\s*[：:】\]\s]*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
             @"[¥￥]\s*([0-9]+(?:\.[0-9]{1,2})?)"
@@ -549,11 +599,60 @@ public sealed class PdfInvoiceConsolidationService
     private static string ExtractVendor(string text)
     {
         var seller = Regex.Match(text, @"销售方信息.{0,80}?名称[:：]\s*([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,40})");
-        if (seller.Success) return seller.Groups[1].Value.Trim();
+        if (seller.Success && !LooksLikeInvoiceTableHeader(seller.Groups[1].Value)) return seller.Groups[1].Value.Trim();
+
+        var knownBuyer = Regex.Match(text, @"深圳博锐创科技有限公司\s+91440300MA5ECG7E71\s+(.{4,80}?)\s+[0-9A-Z]{15,20}");
+        if (knownBuyer.Success)
+        {
+            var value = CleanVendor(knownBuyer.Groups[1].Value);
+            if (!string.IsNullOrWhiteSpace(value) && !LooksLikeInvoiceTableHeader(value)) return value;
+        }
+
+        var betweenTaxIds = Regex.Match(text, @"[0-9A-Z]{15,20}\s+([\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,60})\s+[0-9A-Z]{15,20}");
+        if (betweenTaxIds.Success)
+        {
+            var value = CleanVendor(betweenTaxIds.Groups[1].Value);
+            if (!string.IsNullOrWhiteSpace(value) && !LooksLikeInvoiceTableHeader(value)) return value;
+        }
 
         var name = Path.GetFileNameWithoutExtension(text);
         var parts = Regex.Split(name, @"[_\s]+").Where(p => p.Length >= 4).ToList();
-        return parts.FirstOrDefault(p => p.Any(ch => ch >= '\u4e00' && ch <= '\u9fff')) ?? "";
+        return parts.FirstOrDefault(p => p.Any(ch => ch >= '\u4e00' && ch <= '\u9fff') && !LooksLikeInvoiceTableHeader(p)) ?? "";
+    }
+
+    private static (string Type, string Action) RecognitionIssue(PdfInvoiceRow row)
+    {
+        if (row.Category == "滴滴行程单")
+        {
+            return ("非发票PDF", "作为滴滴行程明细/出行依据保留；需另行匹配对应发票或付款记录。");
+        }
+        if (row.TextLength == 0)
+        {
+            return ("PDF无可提取文本", "需要OCR或换用原始电子发票PDF/XML。");
+        }
+        if (string.IsNullOrWhiteSpace(row.InvoiceNumber) && row.Amount <= 0)
+        {
+            return ("关键字段未命中", "PDF有文本，但现有规则未覆盖版式；可打开样本补充发票号/金额规则。");
+        }
+        if (string.IsNullOrWhiteSpace(row.InvoiceNumber))
+        {
+            return ("发票号未命中", "检查是否为行程单、报销单、付款凭证，或补充发票号规则。");
+        }
+        if (row.Amount <= 0)
+        {
+            return ("金额未命中", "补充金额规则，尤其是非标准“合计xx元”格式。");
+        }
+        return ("人工复核", "查看核验提示和原始PDF。");
+    }
+
+    private static string CleanVendor(string value)
+    {
+        return Regex.Replace(value, @"\s+", "").Trim();
+    }
+
+    private static bool LooksLikeInvoiceTableHeader(string value)
+    {
+        return ContainsAny(value, "项目名称", "规格型号", "统一社会信用代码", "纳税人识别号", "下载次数", "税率", "征收率", "单价", "金额");
     }
 
     private static string InvoiceMonth(string date)
@@ -657,6 +756,7 @@ public sealed class PdfInvoiceConsolidationService
         public string Category { get; set; } = "";
         public string MergeGroup { get; set; } = "";
         public string ReviewFlag { get; set; } = "";
+        public string TextSample { get; set; } = "";
         public PreviousMatchResult PreviousMatch { get; set; } = new();
         public int TextLength { get; set; }
     }
