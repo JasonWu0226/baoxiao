@@ -144,6 +144,7 @@ public sealed class PdfInvoiceConsolidationService
         var roots = config.PreviousInvoiceDirs
             .Where(v => !string.IsNullOrWhiteSpace(v))
             .Select(_workspace.Resolve)
+            .Concat(FindAutoPreviousInvoiceDirs(config))
             .Where(Directory.Exists)
             .Where(dir => !Path.GetFullPath(dir).Equals(Path.GetFullPath(currentInvoiceDir), StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -168,6 +169,59 @@ public sealed class PdfInvoiceConsolidationService
                 };
             })
             .ToList();
+    }
+
+    private IEnumerable<string> FindAutoPreviousInvoiceDirs(AppConfig config)
+    {
+        var sourceRoot = _workspace.Resolve(config.SourceRoot);
+        if (!Directory.Exists(sourceRoot))
+        {
+            return Enumerable.Empty<string>();
+        }
+
+        var matches = Directory.EnumerateDirectories(sourceRoot, "*", SearchOption.AllDirectories)
+            .Where(dir => IsPreviousMaterialDir(Path.GetFileName(dir)))
+            .Where(HasAnyPdf)
+            .Select(Path.GetFullPath)
+            .OrderBy(dir => dir.Length)
+            .ToList();
+
+        var roots = new List<string>();
+        foreach (var dir in matches)
+        {
+            if (!roots.Any(root => IsSubPath(root, dir)))
+            {
+                roots.Add(dir);
+            }
+        }
+
+        return roots;
+    }
+
+    private static bool IsPreviousMaterialDir(string name)
+    {
+        return ContainsAny(name, "上一期", "上期", "历史", "已报销", "往期", "上次报销", "前期报销");
+    }
+
+    private static bool HasAnyPdf(string dir)
+    {
+        try
+        {
+            return Directory.EnumerateFiles(dir, "*.pdf", SearchOption.AllDirectories).Any();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsSubPath(string parent, string child)
+    {
+        var parentFull = Path.GetFullPath(parent).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var childFull = Path.GetFullPath(child).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        return childFull.StartsWith(parentFull, StringComparison.OrdinalIgnoreCase);
     }
 
     private static PreviousMatchResult FindPreviousMatch(PdfInvoiceRow row, List<PreviousInvoiceRow> previous)
