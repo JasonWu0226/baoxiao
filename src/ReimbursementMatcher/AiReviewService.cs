@@ -1,4 +1,5 @@
 using System.Net.Http.Headers;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -38,6 +39,7 @@ public sealed class AiReviewService
     public async Task<string> TestAsync(AppConfig config, CancellationToken ct = default)
     {
         EnsureConfigured(config);
+        await ValidateNetworkAsync(config, ct);
         var content = await ChatAsync(config, config.Ai.Model, "你是报销发票判断助手。请只回复：OK", null, ct);
         return string.IsNullOrWhiteSpace(content) ? "模型无返回内容" : content.Trim();
     }
@@ -142,6 +144,71 @@ JSON 格式：
             .GetProperty("message")
             .GetProperty("content")
             .GetString() ?? "";
+    }
+
+    private static async Task ValidateNetworkAsync(AppConfig config, CancellationToken ct)
+    {
+        var host = ChatEndpoint(config.Ai.BaseUrl).Host;
+        if (!string.IsNullOrWhiteSpace(config.Ai.ProxyUrl))
+        {
+            await ValidateProxyAsync(config.Ai.ProxyUrl, ct);
+            return;
+        }
+
+        try
+        {
+            var addresses = await System.Net.Dns.GetHostAddressesAsync(host, ct);
+            var fakeIp = addresses.Any(a =>
+            {
+                var bytes = a.GetAddressBytes();
+                return a.AddressFamily == AddressFamily.InterNetwork
+                    && bytes.Length == 4
+                    && bytes[0] == 198
+                    && (bytes[1] == 18 || bytes[1] == 19);
+            });
+            if (fakeIp)
+            {
+                throw new InvalidOperationException(
+                    $"当前未设置模型代理地址，但 {host} 被解析到了 198.18/198.19 fake-ip。请在“大模型辅助判断”的“代理地址(可选)”填写 Clash 的 HTTP/Mixed 代理，例如 http://127.0.0.1:7897，并确认该端口已开启。");
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            throw;
+        }
+        catch
+        {
+            // DNS diagnostics are best-effort; let the real API call report the final error.
+        }
+    }
+
+    private static async Task ValidateProxyAsync(string proxyUrl, CancellationToken ct)
+    {
+        if (!Uri.TryCreate(proxyUrl.Trim(), UriKind.Absolute, out var uri)
+            || string.IsNullOrWhiteSpace(uri.Host)
+            || uri.Port <= 0)
+        {
+            throw new InvalidOperationException("模型代理地址格式不正确，请填写类似 http://127.0.0.1:7897 的地址。");
+        }
+
+        try
+        {
+            using var client = new TcpClient();
+            var connectTask = client.ConnectAsync(uri.Host, uri.Port, ct).AsTask();
+            var completed = await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(3), ct));
+            if (completed != connectTask || !client.Connected)
+            {
+                throw new InvalidOperationException($"模型代理端口不可连接：{proxyUrl}。请确认 Clash Verge 已启动内核，并开启 Mixed/HTTP 代理端口。");
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"模型代理端口不可连接：{proxyUrl}。请确认 Clash Verge 已启动内核，并开启 Mixed/HTTP 代理端口。底层错误：{ex.Message}", ex);
+        }
     }
 
     private static Uri ChatEndpoint(string baseUrl)

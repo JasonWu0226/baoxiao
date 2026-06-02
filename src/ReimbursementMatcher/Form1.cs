@@ -1223,8 +1223,9 @@ public partial class Form1 : Form
         }
         catch (Exception ex)
         {
-            Log(errorTitle + "：" + ex.Message);
-            MessageBox.Show(ex.Message, errorTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            var message = ErrorText(ex);
+            Log(errorTitle + "：" + message);
+            MessageBox.Show(message, errorTitle, MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
         finally
         {
@@ -1369,5 +1370,18 @@ public partial class Form1 : Form
     private void Log(string text)
     {
         _logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {text}{Environment.NewLine}");
+    }
+
+    private static string ErrorText(Exception ex)
+    {
+        var parts = new List<string>();
+        for (var current = ex; current != null; current = current.InnerException)
+        {
+            if (!parts.Contains(current.Message))
+            {
+                parts.Add(current.Message);
+            }
+        }
+        return string.Join(Environment.NewLine, parts);
     }
 }
