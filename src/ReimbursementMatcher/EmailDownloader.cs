@@ -74,6 +74,16 @@ public sealed class EmailDownloader
         processingStore.Invoices = BuildExistingInvoiceIndex(outputDir);
         _log($"基于实际发票文件建立查重索引：{processingStore.Invoices.Count} 个");
         var decisionStore = LoadDecisionStore(config);
+        var historyService = new PreviousReimbursementIndexService(_workspace);
+        var historyIndex = historyService.Load(config);
+        if (historyIndex.Invoices.Count > 0)
+        {
+            _log($"已加载上期报销索引：{historyIndex.Invoices.Count} 张上期发票");
+        }
+        else
+        {
+            _log("未找到上期报销索引；如需下载前跳过上期已报销邮件，请先点击“更新上期报销索引”。");
+        }
 
         using var client = new ImapClient();
         _log("连接邮箱 IMAP...");
@@ -135,6 +145,56 @@ public sealed class EmailDownloader
                 });
                 continue;
             }
+
+            var historyMatch = historyService.MatchMail(historyIndex, subject, sender, date, attachmentNames, links.Select(l => l.Url));
+            if (historyMatch.IsMatch && historyMatch.Score >= 85)
+            {
+                var row = MessageRow(
+                    "疑似上期已报销跳过",
+                    date,
+                    subject,
+                    sender,
+                    ids[i].ToString(),
+                    messageId,
+                    messageKey,
+                    attachmentTotal,
+                    links.Count,
+                    0,
+                    1,
+                    historyMatch.Summary,
+                    "上期已报销跳过",
+                    keywordHits,
+                    attachmentNames);
+                row["historical_match_type"] = historyMatch.MatchType;
+                row["historical_match_summary"] = historyMatch.Summary;
+                row["historical_match_file"] = historyMatch.SourcePath;
+                row["duplicate_of"] = historyMatch.SourcePath;
+                rows.Add(row);
+
+                var historyRecord = processingStore.Messages.TryGetValue(messageKey, out var existingHistoryRecord)
+                    ? existingHistoryRecord
+                    : new EmailProcessingRecord { MessageKey = messageKey };
+                historyRecord.Attempts += 1;
+                processingStore.Messages[messageKey] = BuildProcessingRecord(
+                    historyRecord,
+                    messageKey,
+                    messageId,
+                    date,
+                    subject,
+                    sender,
+                    "疑似上期已报销跳过",
+                    "上期已报销跳过",
+                    historyMatch.Summary,
+                    attachmentTotal,
+                    links.Count,
+                    0,
+                    1,
+                    keywordHits,
+                    attachmentNames,
+                    [],
+                    historyMatch);
+                continue;
+            }
             if (IsPreviouslyCompleted(processingStore, messageKey, isInvoiceMail, attachmentTotal, links.Count))
             {
                 var existingFiles = ExistingFilesForMessage(processingStore, messageKey);
@@ -153,6 +213,9 @@ public sealed class EmailDownloader
                     ["link_candidate_total"] = links.Count.ToString(),
                     ["saved_file_count"] = existingFiles.Count.ToString(),
                     ["file"] = string.Join("；", existingFiles),
+                    ["historical_match_type"] = processingStore.Messages.GetValueOrDefault(messageKey)?.HistoricalMatchType ?? "",
+                    ["historical_match_summary"] = processingStore.Messages.GetValueOrDefault(messageKey)?.HistoricalMatchSummary ?? "",
+                    ["historical_match_file"] = processingStore.Messages.GetValueOrDefault(messageKey)?.HistoricalMatchFile ?? "",
                     ["error"] = existingFiles.Count > 0
                         ? $"该邮件此前已成功处理，本地已存在 {existingFiles.Count} 个文件，本次不重复下载"
                         : "该邮件此前已成功处理且无异常，本次不重复下载"
@@ -330,6 +393,10 @@ public sealed class EmailDownloader
         {
             return !currentHasInvoiceSignal;
         }
+        if (record.Status is "疑似上期已报销跳过")
+        {
+            return true;
+        }
 
         return !IsInvoiceRecordWithoutExistingFile(record, currentHasInvoiceSignal);
     }
@@ -363,7 +430,12 @@ public sealed class EmailDownloader
             || record.IsInvoiceMail
             || record.AttachmentTotal > 0
             || record.LinkCandidateTotal > 0
-            || record.Status is "正常已下载" or "已下载" or "PDF已存在跳过" or "重复发票" or "重复已存在" or "已处理跳过";
+            || record.Status is "正常已下载" or "已下载" or "PDF已存在跳过" or "重复发票" or "重复已存在" or "已处理跳过" or "疑似上期已报销跳过";
+
+        if (record.Status is "疑似上期已报销跳过")
+        {
+            return false;
+        }
 
         if (!hasInvoiceSignal)
         {
@@ -633,7 +705,8 @@ public sealed class EmailDownloader
         int duplicate,
         List<string> keywordHits,
         List<string> attachmentNames,
-        List<Dictionary<string, string>> processedRows)
+        List<Dictionary<string, string>> processedRows,
+        PreviousReimbursementMatch? historyMatch = null)
     {
         var savedFiles = processedRows
             .Where(r => !string.IsNullOrWhiteSpace(r.GetValueOrDefault("file")))
@@ -671,6 +744,9 @@ public sealed class EmailDownloader
             DuplicateCount = duplicate,
             DuplicateOf = processedRows.Select(r => r.GetValueOrDefault("duplicate_of")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
             DuplicateSourceMailId = processedRows.Select(r => r.GetValueOrDefault("duplicate_source_mail_id")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
+            HistoricalMatchType = historyMatch?.MatchType ?? processedRows.Select(r => r.GetValueOrDefault("historical_match_type")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
+            HistoricalMatchSummary = historyMatch?.Summary ?? processedRows.Select(r => r.GetValueOrDefault("historical_match_summary")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
+            HistoricalMatchFile = historyMatch?.SourcePath ?? processedRows.Select(r => r.GetValueOrDefault("historical_match_file")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
             Attempts = existing.Attempts,
             KeywordHits = keywordHits,
             AttachmentNames = attachmentNames,

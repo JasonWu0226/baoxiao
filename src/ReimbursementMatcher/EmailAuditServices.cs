@@ -11,6 +11,7 @@ public sealed class EmailAuditService
     public const string HasInvoice = "明确有发票";
     public const string NoInvoice = "明确无发票";
     public const string NeedsReview = "需要人工确认";
+    public const string PreviousReimbursed = "疑似上期已报销";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -128,7 +129,7 @@ public sealed class EmailAuditService
 
         var rows = items.Select(BuildPresenceRow).ToList();
         var needCheck = rows
-            .Where(r => r.NextAction != "无需处理")
+            .Where(r => r.NextAction != "无需处理" && r.FinalDecision != PreviousReimbursed)
             .OrderBy(r => r.Date)
             .ThenBy(r => r.Subject)
             .ToList();
@@ -139,6 +140,11 @@ public sealed class EmailAuditService
             .ToList();
         var noInvoice = rows
             .Where(r => r.FinalDecision == NoInvoice)
+            .OrderBy(r => r.Date)
+            .ThenBy(r => r.Subject)
+            .ToList();
+        var previous = rows
+            .Where(r => r.FinalDecision == PreviousReimbursed)
             .OrderBy(r => r.Date)
             .ThenBy(r => r.Subject)
             .ToList();
@@ -162,6 +168,7 @@ public sealed class EmailAuditService
 
         using var wb = new XLWorkbook();
         WritePresenceSheet(wb, "需要逐封核验", needCheck);
+        WritePresenceSheet(wb, "疑似上期已报销", previous);
         WritePresenceSheet(wb, "有发票且已存在", confirmed);
         WritePresenceSheet(wb, "明确无发票", noInvoice);
         WriteNonPdfSheet(wb, "二维码与非PDF图片", imageFiles);
@@ -269,7 +276,7 @@ public sealed class EmailAuditService
         var likelyAttachment = attachmentRows.Count(r => LooksLikeInvoice(Get(r, "file"), subject) || LooksLikeInvoice(Get(r, "duplicate_of"), subject))
             + (historical?.SavedFiles.Count(f => LooksLikeInvoice(f.Path, subject) || LooksLikeInvoice(f.FileName, subject)) ?? 0);
         var downloaded = Math.Max(rows.Count(r => !string.IsNullOrWhiteSpace(Get(r, "file")) && Get(r, "status") is "已下载" or "正常已下载" or "页面解析已下载"), historical?.SavedFileCount ?? 0);
-        var skipped = rows.Count(r => Get(r, "status") is "重复跳过" or "重复已存在" or "重复发票" or "PDF已存在跳过" or "已处理跳过" or "人工确认无发票跳过" or "附件已取得发票，链接跳过");
+        var skipped = rows.Count(r => Get(r, "status") is "重复跳过" or "重复已存在" or "重复发票" or "PDF已存在跳过" or "已处理跳过" or "人工确认无发票跳过" or "附件已取得发票，链接跳过" or "疑似上期已报销跳过");
         var hasInvoiceKeyword = LooksLikeInvoice(subject, string.Join(" ", files));
         var hasPlatform = ContainsAny(subject, "美团", "三快", "淘宝", "天猫", "京东", "携程", "ctrip", "jd.com", "taobao", "tmall");
         var hasLikelyLink = urls.Any(u => LooksLikeInvoice(u, subject));
@@ -277,7 +284,15 @@ public sealed class EmailAuditService
         var hasRiskStatus = rows.Select(r => Get(r, "status")).Any(s => s is "未下载到文件" or "失败" or "需人工确认" or "待核验" or "异常" or "链接取票待处理");
         var errors = rows.Select(r => Get(r, "error")).Where(IsRealError).ToList();
         var statusSet = rows.Select(r => Get(r, "status")).Where(s => !string.IsNullOrWhiteSpace(s)).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var ruleDecision = DecideByRule(hasInvoiceKeyword, hasPlatform, attachmentCount, likelyAttachment, hasLikelyLink, hasAnyLink, downloaded, skipped, hasRiskStatus, errors.Count, statusSet);
+        var historicalMatch = FirstNonEmpty(
+            rows.Select(r => Get(r, "historical_match_summary")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
+            historical?.HistoricalMatchSummary ?? "");
+        var historicalFile = FirstNonEmpty(
+            rows.Select(r => Get(r, "historical_match_file")).FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "",
+            historical?.HistoricalMatchFile ?? "");
+        var ruleDecision = !string.IsNullOrWhiteSpace(historicalMatch)
+            ? PreviousReimbursed
+            : DecideByRule(hasInvoiceKeyword, hasPlatform, attachmentCount, likelyAttachment, hasLikelyLink, hasAnyLink, downloaded, skipped, hasRiskStatus, errors.Count, statusSet);
 
         var item = new EmailAuditItem
         {
@@ -297,7 +312,9 @@ public sealed class EmailAuditService
             DownloadedFileCount = downloaded,
             SkippedOrDuplicateCount = skipped,
             NeedsHumanReview = ruleDecision == NeedsReview,
-            Reason = BuildReason(hasInvoiceKeyword, hasPlatform, attachmentCount, likelyAttachment, hasLikelyLink, downloaded, skipped, hasRiskStatus, errors.Count),
+            HistoricalMatch = historicalMatch,
+            HistoricalMatchFile = historicalFile,
+            Reason = MergeReason(BuildReason(hasInvoiceKeyword, hasPlatform, attachmentCount, likelyAttachment, hasLikelyLink, downloaded, skipped, hasRiskStatus, errors.Count), historicalMatch),
             Files = string.Join(Environment.NewLine, files),
             Urls = string.Join(Environment.NewLine, urls)
         };
@@ -319,6 +336,7 @@ public sealed class EmailAuditService
 
     private static string DecideByRule(bool invoiceKeyword, bool platformKeyword, int attachmentCount, int likelyAttachment, bool likelyLink, bool anyLink, int downloaded, int skipped, bool riskStatus, int errors, HashSet<string> statuses)
     {
+        if (statuses.Contains("疑似上期已报销跳过")) return PreviousReimbursed;
         if (!invoiceKeyword && attachmentCount == 0 && !anyLink && downloaded == 0 && skipped == 0) return NoInvoice;
         if (invoiceKeyword && (downloaded > 0 || likelyAttachment > 0 || skipped > 0 || attachmentCount > 0 && HasBenignHandledStatus(statuses))) return HasInvoice;
         if (invoiceKeyword && platformKeyword && attachmentCount > 0 && skipped > 0) return HasInvoice;
@@ -331,7 +349,7 @@ public sealed class EmailAuditService
 
     private static bool HasBenignHandledStatus(HashSet<string> statuses)
     {
-        return statuses.Any(s => s is "已处理跳过" or "重复跳过" or "重复已存在" or "重复发票" or "PDF已存在跳过" or "附件已取得发票，链接跳过");
+        return statuses.Any(s => s is "已处理跳过" or "重复跳过" or "重复已存在" or "重复发票" or "PDF已存在跳过" or "附件已取得发票，链接跳过" or "疑似上期已报销跳过");
     }
 
     private static bool IsRealError(string error)
@@ -344,6 +362,9 @@ public sealed class EmailAuditService
             "非PDF格式不下载",
             "附件已取得发票",
             "重复发票",
+            "上期索引",
+            "发票号命中上期",
+            "金额和销售方命中上期",
             "人工确认为无发票");
     }
 
@@ -362,10 +383,16 @@ public sealed class EmailAuditService
         return string.Join("；", reasons);
     }
 
+    private static string MergeReason(string reason, string historicalMatch)
+    {
+        if (string.IsNullOrWhiteSpace(historicalMatch)) return reason;
+        return string.IsNullOrWhiteSpace(reason) ? historicalMatch : $"{reason}；{historicalMatch}";
+    }
+
     private static void WriteSheet(XLWorkbook wb, string name, List<EmailAuditItem> items)
     {
         var ws = wb.Worksheets.Add(name);
-        var headers = new[] { "最终判断", "规则判断", "人工判断", "邮件日期", "邮件主题", "邮件ID", "状态", "有发票关键字", "有平台关键字", "有附件", "附件数", "疑似发票附件", "疑似发票链接", "下载数", "重复/跳过数", "判断原因", "人工备注", "文件清单", "链接清单" };
+        var headers = new[] { "最终判断", "规则判断", "人工判断", "邮件日期", "邮件主题", "邮件ID", "状态", "有发票关键字", "有平台关键字", "有附件", "附件数", "疑似发票附件", "疑似发票链接", "下载数", "重复/跳过数", "上期匹配", "上期文件", "判断原因", "人工备注", "文件清单", "链接清单" };
         for (var c = 0; c < headers.Length; c++)
         {
             ws.Cell(1, c + 1).Value = headers[c];
@@ -390,14 +417,17 @@ public sealed class EmailAuditService
             ws.Cell(r, 13).Value = item.HasLikelyInvoiceLink ? "是" : "否";
             ws.Cell(r, 14).Value = item.DownloadedFileCount;
             ws.Cell(r, 15).Value = item.SkippedOrDuplicateCount;
-            ws.Cell(r, 16).Value = item.Reason;
-            ws.Cell(r, 17).Value = item.Note;
-            ws.Cell(r, 18).Value = item.Files;
-            ws.Cell(r, 19).Value = item.Urls;
+            ws.Cell(r, 16).Value = item.HistoricalMatch;
+            ws.Cell(r, 17).Value = item.HistoricalMatchFile;
+            ws.Cell(r, 18).Value = item.Reason;
+            ws.Cell(r, 19).Value = item.Note;
+            ws.Cell(r, 20).Value = item.Files;
+            ws.Cell(r, 21).Value = item.Urls;
             ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = item.FinalDecision switch
             {
                 HasInvoice => XLColor.FromHtml("#D9EAD3"),
                 NoInvoice => XLColor.FromHtml("#E5E7EB"),
+                PreviousReimbursed => XLColor.FromHtml("#EADCF8"),
                 _ => XLColor.FromHtml("#FFF2CC")
             };
             r++;
@@ -415,6 +445,7 @@ public sealed class EmailAuditService
             ("邮件总数", items.Count),
             (HasInvoice, items.Count(i => i.FinalDecision == HasInvoice)),
             (NoInvoice, items.Count(i => i.FinalDecision == NoInvoice)),
+            (PreviousReimbursed, items.Count(i => i.FinalDecision == PreviousReimbursed)),
             (NeedsReview, items.Count(i => i.FinalDecision == NeedsReview)),
             ("已有人工判断", items.Count(i => !string.IsNullOrWhiteSpace(i.ManualDecision))),
             ("命中发票关键字", items.Count(i => i.HasInvoiceKeyword)),
@@ -443,10 +474,13 @@ public sealed class EmailAuditService
         var hasLink = !string.IsNullOrWhiteSpace(item.Urls);
         var isLinkPending = item.Status.Contains("链接取票待处理", StringComparison.OrdinalIgnoreCase)
             || item.Reason.Contains("链接取票待处理", StringComparison.OrdinalIgnoreCase);
+        var isPrevious = item.FinalDecision == PreviousReimbursed;
         var hasInvoice = item.FinalDecision == HasInvoice;
         var needsReview = item.FinalDecision == NeedsReview || item.NeedsHumanReview;
 
-        var status = hasInvoice && existingFiles.Count > 0
+        var status = isPrevious
+            ? "疑似上期已报销"
+            : hasInvoice && existingFiles.Count > 0
             ? "已确认存在"
             : hasInvoice && item.SkippedOrDuplicateCount > 0 && existingFiles.Count == 0
                 ? "有发票但仅显示重复/跳过"
@@ -460,6 +494,7 @@ public sealed class EmailAuditService
         {
             "已确认存在" => "无需处理",
             "明确无发票" => "无需处理",
+            "疑似上期已报销" => "核对上期文件；确认后本期不重复下载和报销",
             "有发票但仅显示重复/跳过" => "打开下载清单核对重复来源；必要时重新下载异常邮件",
             "有发票但未找到本地文件" when isLinkPending || hasLink => "打开链接或二维码取票；下载后重新生成核验表",
             "有发票但未找到本地文件" => "重新下载该邮件或人工打开邮件核对附件",
@@ -566,6 +601,7 @@ public sealed class EmailAuditService
             ("明确有发票邮件", rows.Count(r => r.FinalDecision == HasInvoice)),
             ("有发票且本地已存在", rows.Count(r => r.FinalDecision == HasInvoice && r.ExistingFileCount > 0)),
             ("有发票但需继续核验", rows.Count(r => r.FinalDecision == HasInvoice && r.NextAction != "无需处理")),
+            ("疑似上期已报销邮件", rows.Count(r => r.FinalDecision == PreviousReimbursed)),
             ("需要人工判断邮件", rows.Count(r => r.FinalDecision == NeedsReview)),
             ("明确无发票邮件", rows.Count(r => r.FinalDecision == NoInvoice)),
             ("图片/二维码候选", nonPdfRows.Count(r => r.Type != "ICO图标")),

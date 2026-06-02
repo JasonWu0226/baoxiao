@@ -119,6 +119,9 @@ public sealed class EmailProcessingRecord
     public int DuplicateCount { get; set; }
     public string DuplicateOf { get; set; } = "";
     public string DuplicateSourceMailId { get; set; } = "";
+    public string HistoricalMatchType { get; set; } = "";
+    public string HistoricalMatchSummary { get; set; } = "";
+    public string HistoricalMatchFile { get; set; } = "";
     public int Attempts { get; set; }
     public List<string> KeywordHits { get; set; } = new();
     public List<string> AttachmentNames { get; set; } = new();
@@ -177,10 +180,58 @@ public sealed class EmailAuditItem
     public int DownloadedFileCount { get; set; }
     public int SkippedOrDuplicateCount { get; set; }
     public bool NeedsHumanReview { get; set; }
+    public string HistoricalMatch { get; set; } = "";
+    public string HistoricalMatchFile { get; set; } = "";
     public string Reason { get; set; } = "";
     public string Files { get; set; } = "";
     public string Urls { get; set; } = "";
     public string Note { get; set; } = "";
+}
+
+public sealed class PreviousReimbursementIndex
+{
+    public int Version { get; set; } = 1;
+    public string UpdatedAt { get; set; } = "";
+    public List<string> SourceRoots { get; set; } = new();
+    public List<PreviousReimbursementInvoice> Invoices { get; set; } = new();
+    public List<PreviousReimbursementDocument> Documents { get; set; } = new();
+}
+
+public sealed class PreviousReimbursementInvoice
+{
+    public string SourceRoot { get; set; } = "";
+    public string SourcePath { get; set; } = "";
+    public string FileName { get; set; } = "";
+    public string Sha256 { get; set; } = "";
+    public string InvoiceNumber { get; set; } = "";
+    public decimal Amount { get; set; }
+    public string InvoiceDate { get; set; } = "";
+    public string Vendor { get; set; } = "";
+    public string Category { get; set; } = "";
+    public string RelatedDocument { get; set; } = "";
+}
+
+public sealed class PreviousReimbursementDocument
+{
+    public string SourceRoot { get; set; } = "";
+    public string SourcePath { get; set; } = "";
+    public string FileName { get; set; } = "";
+    public string Kind { get; set; } = "";
+    public long SizeBytes { get; set; }
+    public string UpdatedAt { get; set; } = "";
+}
+
+public sealed class PreviousReimbursementMatch
+{
+    public bool IsMatch { get; set; }
+    public int Score { get; set; }
+    public string MatchType { get; set; } = "";
+    public string Summary { get; set; } = "";
+    public string SourcePath { get; set; } = "";
+    public string InvoiceNumber { get; set; } = "";
+    public decimal Amount { get; set; }
+    public string InvoiceDate { get; set; } = "";
+    public string Vendor { get; set; } = "";
 }
 
 public sealed class AiReviewResult

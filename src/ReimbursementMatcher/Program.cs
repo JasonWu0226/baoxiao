@@ -69,6 +69,12 @@ static class Program
             Console.WriteLine(output);
             return;
         }
+        if (arg == "--previous-index")
+        {
+            var output = new PreviousReimbursementIndexService(workspace).Generate(config);
+            Console.WriteLine(output);
+            return;
+        }
         if (arg == "--email-download" || arg == "--email-download-abnormal")
         {
             var password = config.Email.Password;

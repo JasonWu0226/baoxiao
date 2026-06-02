@@ -16,6 +16,7 @@ public partial class Form1 : Form
     private readonly AiReviewService _aiReviewService;
     private readonly EmailAuditReportService _emailAuditReporter;
     private readonly EmailAuditService _emailAuditService;
+    private readonly PreviousReimbursementIndexService _previousIndexService;
 
     private readonly BindingList<EvidenceItem> _items = new();
     private readonly BindingList<EvidenceItem> _invoiceItems = new();
@@ -94,6 +95,7 @@ public partial class Form1 : Form
         _aiReviewService = new AiReviewService(_workspace, Log);
         _emailAuditReporter = new EmailAuditReportService(_workspace);
         _emailAuditService = new EmailAuditService(_workspace);
+        _previousIndexService = new PreviousReimbursementIndexService(_workspace);
         BuildLayout();
         LoadConfig();
     }
@@ -246,6 +248,8 @@ public partial class Form1 : Form
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
         _hideDoneDownloads.CheckedChanged += (_, _) => RefreshDownloadView();
         buttons.Controls.Add(_hideDoneDownloads);
+        buttons.Controls.Add(Button("更新上期报销索引", (_, _) => GeneratePreviousReimbursementIndex(), primary: true));
+        buttons.Controls.Add(Button("打开上期索引", (_, _) => OpenPreviousReimbursementIndex()));
         buttons.Controls.Add(Button("读取最新下载清单", (_, _) => LoadDownloadRecords()));
         buttons.Controls.Add(Button("只重处理异常邮件", async (s, _) => await DownloadEmailInvoicesAsync(s as Button, onlyAbnormal: true)));
         buttons.Controls.Add(Button("打开选中链接/文件", (_, _) => OpenSelectedDownloadTarget()));
@@ -281,6 +285,7 @@ public partial class Form1 : Form
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
         _hideDoneEmailAudit.CheckedChanged += (_, _) => RefreshEmailAuditView();
         buttons.Controls.Add(_hideDoneEmailAudit);
+        buttons.Controls.Add(Button("更新上期报销索引", (_, _) => GeneratePreviousReimbursementIndex()));
         buttons.Controls.Add(Button("读取邮件判断清单", (_, _) => LoadEmailAuditItems(), primary: true));
         buttons.Controls.Add(Button("生成邮件判断Excel", (_, _) => GenerateEmailChecklistExcel()));
         buttons.Controls.Add(Button("生成发票存在性核验Excel", (_, _) => GenerateInvoicePresenceExcel()));
@@ -506,6 +511,7 @@ public partial class Form1 : Form
         AddColumn(_emailAuditGrid, "HasLikelyInvoiceLink", "疑似链接", 90);
         AddColumn(_emailAuditGrid, "DownloadedFileCount", "下载数", 70);
         AddColumn(_emailAuditGrid, "SkippedOrDuplicateCount", "跳过数", 70);
+        AddColumn(_emailAuditGrid, "HistoricalMatch", "上期匹配", 220);
         AddColumn(_emailAuditGrid, "Reason", "判断原因", 280);
         AddColumn(_emailAuditGrid, "Note", "人工备注", 180);
         _emailAuditGrid.SelectionChanged += (_, _) => UpdateEmailAuditDetail(SelectedEmailAuditItem());
@@ -908,7 +914,7 @@ public partial class Form1 : Form
     private static bool NeedsDownloadAttention(DownloadRecord record)
     {
         return record.Status is "未下载到文件" or "失败" or "需人工确认" or "待核验" or "异常" or "链接取票待处理"
-            || !string.IsNullOrWhiteSpace(record.Error) && record.Status is not "PDF已存在跳过" and not "已处理跳过" and not "人工确认无发票跳过" and not "附件已取得发票，链接跳过";
+            || !string.IsNullOrWhiteSpace(record.Error) && record.Status is not "PDF已存在跳过" and not "已处理跳过" and not "人工确认无发票跳过" and not "附件已取得发票，链接跳过" and not "疑似上期已报销跳过";
     }
 
     private EmailAuditItem? SelectedEmailAuditItem() => _emailAuditGrid.CurrentRow?.DataBoundItem as EmailAuditItem;
@@ -933,6 +939,8 @@ public partial class Form1 : Form
             $"附件数：{item.AttachmentCount}{Environment.NewLine}" +
             $"下载数：{item.DownloadedFileCount}{Environment.NewLine}" +
             $"重复/跳过数：{item.SkippedOrDuplicateCount}{Environment.NewLine}" +
+            $"上期匹配：{item.HistoricalMatch}{Environment.NewLine}" +
+            $"上期文件：{item.HistoricalMatchFile}{Environment.NewLine}" +
             $"文件：{Environment.NewLine}{item.Files}{Environment.NewLine}{Environment.NewLine}" +
             $"链接：{Environment.NewLine}{item.Urls}{Environment.NewLine}{Environment.NewLine}" +
             $"备注：{item.Note}";
@@ -1155,6 +1163,44 @@ public partial class Form1 : Form
         MessageBox.Show($"已归档 {moved} 个同一发票已有 PDF 的非 PDF 格式文件。", "归档完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
+    private void GeneratePreviousReimbursementIndex()
+    {
+        SaveConfig();
+        try
+        {
+            var output = _previousIndexService.Generate(_config);
+            var index = _previousIndexService.Load(_config);
+            Log($"已更新上期报销索引：发票 {index.Invoices.Count} 张，报销文档 {index.Documents.Count} 个。查询表：{output}");
+            Process.Start(new ProcessStartInfo(output) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            var message = ErrorText(ex);
+            Log("更新上期报销索引失败：" + message);
+            MessageBox.Show(message, "更新上期报销索引失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void OpenPreviousReimbursementIndex()
+    {
+        SaveConfig();
+        var workbook = _previousIndexService.LatestWorkbook(_config);
+        if (!string.IsNullOrWhiteSpace(workbook) && File.Exists(workbook))
+        {
+            Process.Start(new ProcessStartInfo(workbook) { UseShellExecute = true });
+            return;
+        }
+
+        var json = _previousIndexService.IndexPath(_config);
+        if (File.Exists(json))
+        {
+            Process.Start(new ProcessStartInfo(json) { UseShellExecute = true });
+            return;
+        }
+
+        MessageBox.Show("还没有上期报销索引，请先点击“更新上期报销索引”。", "没有索引", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
     private void ConsolidatePdfInvoices()
     {
         SaveConfig();
@@ -1365,6 +1411,7 @@ public partial class Form1 : Form
             {
                 if (record.Status is "已下载" or "正常已下载" or "页面解析已下载" or "已处理跳过" or "无发票内容已跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(217, 234, 211);
                 else if (record.Status is "人工确认无发票跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
+                else if (record.Status is "疑似上期已报销跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(234, 220, 248);
                 else if (record.Status is "重复跳过" or "重复已存在" or "重复发票" or "PDF已存在跳过" or "非发票邮件" or "附件已取得发票，链接跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
                 else if (record.Status is "未下载到文件" or "失败" or "需人工确认" or "待核验" or "异常" or "链接取票待处理" || !string.IsNullOrWhiteSpace(record.Error)) row.DefaultCellStyle.BackColor = Color.FromArgb(255, 242, 204);
             }
@@ -1372,6 +1419,7 @@ public partial class Form1 : Form
             {
                 if (email.FinalDecision == EmailAuditService.HasInvoice) row.DefaultCellStyle.BackColor = Color.FromArgb(217, 234, 211);
                 else if (email.FinalDecision == EmailAuditService.NoInvoice) row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
+                else if (email.FinalDecision == EmailAuditService.PreviousReimbursed) row.DefaultCellStyle.BackColor = Color.FromArgb(234, 220, 248);
                 else row.DefaultCellStyle.BackColor = Color.FromArgb(255, 242, 204);
             }
         }
