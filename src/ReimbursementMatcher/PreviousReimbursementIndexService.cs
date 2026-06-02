@@ -218,20 +218,25 @@ public sealed class PreviousReimbursementIndexService
     {
         var text = ExtractInvoiceText(path);
         var combined = $"{Path.GetFileName(path)} {path} {text}";
+        var qr = InvoiceQrCodeService.ExtractFromPdfImages(path);
         var invoice = new PreviousReimbursementInvoice
         {
             SourceRoot = root,
             SourcePath = path,
             FileName = Path.GetFileName(path),
             Sha256 = Sha256(path),
-            InvoiceNumber = ExtractInvoiceNo(combined),
+            InvoiceNumber = FirstNonEmpty(ExtractInvoiceNo(combined), qr.InvoiceNumber),
             Amount = ExtractAmount(combined),
-            InvoiceDate = ExtractDate(combined),
+            InvoiceDate = FirstNonEmpty(ExtractDate(combined), qr.InvoiceDate),
             Vendor = ExtractVendor(combined, config),
             Category = DetectCategory(combined),
             RelatedDocument = FindRelatedDocument(path, documents),
-            TextStatus = string.IsNullOrWhiteSpace(text) ? "无可提取文本" : $"已提取文本({text.Length})"
+            TextStatus = BuildTextStatus(text, qr)
         };
+        if (invoice.Amount <= 0 && qr.Amount > 0)
+        {
+            invoice.Amount = qr.Amount;
+        }
         FillRecognitionStatus(invoice, text);
         return invoice;
     }
@@ -691,7 +696,9 @@ public sealed class PreviousReimbursementIndexService
         var issues = new List<string>();
         if (string.IsNullOrWhiteSpace(extractedText))
         {
-            issues.Add("PDF无可提取文本/可能是扫描件");
+            issues.Add(invoice.TextStatus.Contains("已识别发票二维码", StringComparison.OrdinalIgnoreCase)
+                ? "图片型PDF，已通过二维码补核心字段"
+                : "PDF无可提取文本/可能是扫描件");
         }
 
         if (string.IsNullOrWhiteSpace(invoice.InvoiceNumber))
@@ -722,6 +729,22 @@ public sealed class PreviousReimbursementIndexService
 
         invoice.RecognitionIssues = string.Join("；", issues.Distinct());
         invoice.RecognitionStatus = issues.Count == 0 ? "完整" : "需复核";
+    }
+
+    private static string BuildTextStatus(string text, InvoiceQrMetadata qr)
+    {
+        var parts = new List<string>();
+        parts.Add(string.IsNullOrWhiteSpace(text) ? "无可提取文本" : $"已提取文本({text.Length})");
+        if (!string.IsNullOrWhiteSpace(qr.Raw))
+        {
+            parts.Add("已识别发票二维码");
+        }
+        return string.Join("；", parts);
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "";
     }
 
     private static string ExtractVendor(string text, AppConfig config)

@@ -116,9 +116,14 @@ public sealed class InvoiceRecognitionAuditService
         };
 
         var textResult = ExtractText(file);
+        var qr = InvoiceQrCodeService.ExtractFromPdfImages(file);
         row.TextStatus = textResult.Status;
+        if (!string.IsNullOrWhiteSpace(qr.Raw))
+        {
+            row.TextStatus += "；已识别发票二维码";
+        }
         row.TextLength = textResult.Text.Length;
-        row.TextPreview = Shorten(textResult.Text, 300);
+        row.TextPreview = Shorten(string.IsNullOrWhiteSpace(qr.Raw) ? textResult.Text : $"二维码:{qr.Raw} {textResult.Text}", 300);
         row.IsLikelyInvoice = LooksLikeInvoiceText(textResult.Text) || LooksLikeInvoiceName(row.FileName);
 
         if (row.Extension == ".ico")
@@ -135,7 +140,9 @@ public sealed class InvoiceRecognitionAuditService
         }
         else if (row.Extension == ".pdf" && row.TextLength == 0)
         {
-            row.Issues.Add("PDF无可提取文本，可能是扫描件或图片型PDF");
+            row.Issues.Add(!string.IsNullOrWhiteSpace(qr.Raw)
+                ? "图片型PDF，已通过二维码补核心字段"
+                : "PDF无可提取文本，可能是扫描件或图片型PDF");
         }
         else if (row.Extension == ".ofd" && row.TextLength == 0)
         {
@@ -143,9 +150,13 @@ public sealed class InvoiceRecognitionAuditService
         }
 
         var combined = $"{row.FileName} {textResult.Text}";
-        row.InvoiceNumber = ExtractInvoiceNo(combined);
-        row.InvoiceDate = ExtractDate(combined);
+        row.InvoiceNumber = FirstNonEmpty(ExtractInvoiceNo(combined), qr.InvoiceNumber);
+        row.InvoiceDate = FirstNonEmpty(ExtractDate(combined), qr.InvoiceDate);
         row.Amount = ExtractAmount(combined);
+        if (row.Amount <= 0 && qr.Amount > 0)
+        {
+            row.Amount = qr.Amount;
+        }
         row.BuyerName = ExtractBuyerName(combined);
         row.BuyerTaxId = ExtractBuyerTaxId(combined);
         row.Vendor = ExtractVendor(combined);
@@ -709,6 +720,11 @@ public sealed class InvoiceRecognitionAuditService
         }
         value = value.Trim();
         return value.Length <= max ? value : value[..max];
+    }
+
+    private static string FirstNonEmpty(params string[] values)
+    {
+        return values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v)) ?? "";
     }
 
     private static bool ContainsAny(string value, params string[] keywords)
