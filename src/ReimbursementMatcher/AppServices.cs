@@ -386,7 +386,9 @@ public sealed class MaterialScanner
             return true;
         }
         var normalized = file.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
-        return normalized.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase);
+        return normalized.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"{Path.DirectorySeparatorChar}日期不符发票_", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"{Path.DirectorySeparatorChar}_日期不符发票{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void ExtractZipInvoices(string root)
@@ -396,7 +398,9 @@ public sealed class MaterialScanner
         {
             var normalized = zip.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
             if (normalized.Contains($"{Path.DirectorySeparatorChar}_zip解压缓存{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase)
-                || normalized.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase))
+                || normalized.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains($"{Path.DirectorySeparatorChar}日期不符发票_", StringComparison.OrdinalIgnoreCase)
+                || normalized.Contains($"{Path.DirectorySeparatorChar}_日期不符发票{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -840,6 +844,92 @@ public sealed class InvoiceFileCleaner
         }
 
         return moved;
+    }
+
+    public int ArchiveDateRejectedInvoices(AppConfig config)
+    {
+        var invoiceDir = _workspace.Resolve(config.InvoiceDir);
+        if (!Directory.Exists(invoiceDir))
+        {
+            return 0;
+        }
+
+        var startText = !string.IsNullOrWhiteSpace(config.Email.Start) ? config.Email.Start : config.DateStart;
+        if (!DateTime.TryParse(startText, out var start))
+        {
+            return 0;
+        }
+
+        var archiveRoot = _workspace.Resolve(Path.Combine(config.ArchiveDir, $"日期不符发票_{DateTime.Now:yyyyMMdd_HHmmss}"));
+        var moved = 0;
+        foreach (var file in Directory.EnumerateFiles(invoiceDir, "*.pdf", SearchOption.AllDirectories).ToList())
+        {
+            if (IsInsideCleanerArchive(file))
+            {
+                continue;
+            }
+
+            var invoiceDate = ReadPdfDate(file);
+            if (string.IsNullOrWhiteSpace(invoiceDate)
+                || !DateTime.TryParse(invoiceDate, out var parsed)
+                || parsed.Date >= start.Date)
+            {
+                continue;
+            }
+
+            var relative = Path.GetRelativePath(invoiceDir, file);
+            var target = UniquePath(Path.Combine(archiveRoot, relative));
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Move(file, target);
+            File.WriteAllText(target + ".reason.txt", $"发票日期 {invoiceDate} 早于开始时间 {start:yyyy-MM-dd}，不纳入本期报销。" + Environment.NewLine, Encoding.UTF8);
+            moved++;
+        }
+
+        return moved;
+    }
+
+    private static bool IsInsideCleanerArchive(string file)
+    {
+        var normalized = file.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        return normalized.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"{Path.DirectorySeparatorChar}日期不符发票_", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"{Path.DirectorySeparatorChar}_日期不符发票{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string ReadPdfDate(string file)
+    {
+        try
+        {
+            using var document = PdfDocument.Open(file);
+            var builder = new StringBuilder();
+            foreach (var page in document.GetPages().Take(3))
+            {
+                builder.AppendLine(page.Text);
+            }
+            return ExtractDate(Regex.Replace(builder.ToString(), @"\s+", " "));
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static string ExtractDate(string text)
+    {
+        var match = Regex.Match(text, @"(20\d{2})[-_.年/](\d{1,2})[-_.月/](\d{1,2})");
+        if (match.Success)
+        {
+            var value = $"{int.Parse(match.Groups[1].Value):0000}-{int.Parse(match.Groups[2].Value):00}-{int.Parse(match.Groups[3].Value):00}";
+            return DateTime.TryParse(value, out var parsed) ? parsed.ToString("yyyy-MM-dd") : "";
+        }
+        match = Regex.Match(text, @"(?<!\d)(20\d{6})(?!\d)");
+        if (match.Success)
+        {
+            var value = match.Groups[1].Value;
+            var normalized = $"{value[..4]}-{value.Substring(4, 2)}-{value.Substring(6, 2)}";
+            return DateTime.TryParse(normalized, out var parsed) ? parsed.ToString("yyyy-MM-dd") : "";
+        }
+        return "";
     }
 
     private static string UniquePath(string path)

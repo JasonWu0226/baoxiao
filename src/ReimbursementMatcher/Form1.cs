@@ -256,6 +256,7 @@ public partial class Form1 : Form
         buttons.Controls.Add(Button("生成邮件统计Excel", (_, _) => GenerateEmailAuditReport()));
         buttons.Controls.Add(Button("打开清单目录", (_, _) => OpenDir(_config.Email.OutputDir)));
         buttons.Controls.Add(Button("归档非PDF重复格式", (_, _) => ArchiveNonPdfInvoiceFormats()));
+        buttons.Controls.Add(Button("归档日期不符发票", (_, _) => ArchiveDateRejectedInvoices()));
         buttons.Controls.Add(Button("归集PDF发票并汇总", (_, _) => ConsolidatePdfInvoices()));
         buttons.Controls.Add(Button("处理非PDF/二维码/AI判断", async (s, _) => await ProcessNonPdfAndQrAsync(s as Button)));
         buttons.Controls.Add(new Label
@@ -648,6 +649,11 @@ public partial class Form1 : Form
         _invoiceDir.Text = _config.Email.OutputDir;
         _config.InvoiceDir = _config.Email.OutputDir;
         _workspace.SaveConfig(_config);
+        var dateRejected = _invoiceCleaner.ArchiveDateRejectedInvoices(_config);
+        if (dateRejected > 0)
+        {
+            Log($"下载前已归档日期早于开始时间的发票：{dateRejected} 个。");
+        }
 
         if (button != null) button.Enabled = false;
         try
@@ -914,7 +920,7 @@ public partial class Form1 : Form
     private static bool NeedsDownloadAttention(DownloadRecord record)
     {
         return record.Status is "未下载到文件" or "失败" or "需人工确认" or "待核验" or "异常" or "链接取票待处理"
-            || !string.IsNullOrWhiteSpace(record.Error) && record.Status is not "PDF已存在跳过" and not "已处理跳过" and not "人工确认无发票跳过" and not "附件已取得发票，链接跳过" and not "疑似上期已报销跳过";
+            || !string.IsNullOrWhiteSpace(record.Error) && record.Status is not "PDF已存在跳过" and not "已处理跳过" and not "人工确认无发票跳过" and not "附件已取得发票，链接跳过" and not "疑似上期已报销跳过" and not "发票日期早于开始时间跳过";
     }
 
     private EmailAuditItem? SelectedEmailAuditItem() => _emailAuditGrid.CurrentRow?.DataBoundItem as EmailAuditItem;
@@ -1161,6 +1167,16 @@ public partial class Form1 : Form
         Log($"已归档非PDF重复格式文件：{moved} 个。");
         ScanMaterials();
         MessageBox.Show($"已归档 {moved} 个同一发票已有 PDF 的非 PDF 格式文件。", "归档完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    private void ArchiveDateRejectedInvoices()
+    {
+        SaveConfig();
+        _config.InvoiceDir = string.IsNullOrWhiteSpace(_invoiceDir.Text) ? _config.InvoiceDir : _invoiceDir.Text.Trim();
+        var moved = _invoiceCleaner.ArchiveDateRejectedInvoices(_config);
+        Log($"已归档日期早于开始时间的发票：{moved} 个。");
+        ScanMaterials();
+        MessageBox.Show($"已归档 {moved} 个开票日期早于开始时间的 PDF 发票。", "归档完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void GeneratePreviousReimbursementIndex()
@@ -1410,7 +1426,7 @@ public partial class Form1 : Form
             if (row.DataBoundItem is DownloadRecord record)
             {
                 if (record.Status is "已下载" or "正常已下载" or "页面解析已下载" or "已处理跳过" or "无发票内容已跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(217, 234, 211);
-                else if (record.Status is "人工确认无发票跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
+                else if (record.Status is "人工确认无发票跳过" or "发票日期早于开始时间跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
                 else if (record.Status is "疑似上期已报销跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(234, 220, 248);
                 else if (record.Status is "重复跳过" or "重复已存在" or "重复发票" or "PDF已存在跳过" or "非发票邮件" or "附件已取得发票，链接跳过") row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
                 else if (record.Status is "未下载到文件" or "失败" or "需人工确认" or "待核验" or "异常" or "链接取票待处理" || !string.IsNullOrWhiteSpace(record.Error)) row.DefaultCellStyle.BackColor = Color.FromArgb(255, 242, 204);
@@ -1418,7 +1434,7 @@ public partial class Form1 : Form
             if (row.DataBoundItem is EmailAuditItem email)
             {
                 if (email.FinalDecision == EmailAuditService.HasInvoice) row.DefaultCellStyle.BackColor = Color.FromArgb(217, 234, 211);
-                else if (email.FinalDecision == EmailAuditService.NoInvoice) row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
+                else if (email.FinalDecision == EmailAuditService.NoInvoice || email.FinalDecision == EmailAuditService.DateOutOfRange) row.DefaultCellStyle.BackColor = Color.FromArgb(229, 231, 235);
                 else if (email.FinalDecision == EmailAuditService.PreviousReimbursed) row.DefaultCellStyle.BackColor = Color.FromArgb(234, 220, 248);
                 else row.DefaultCellStyle.BackColor = Color.FromArgb(255, 242, 204);
             }

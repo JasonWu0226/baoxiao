@@ -93,6 +93,12 @@ static class Program
             Console.WriteLine($"已归档非PDF重复格式文件：{moved}");
             return;
         }
+        if (arg == "--archive-date-rejected-invoices")
+        {
+            var moved = new InvoiceFileCleaner(workspace).ArchiveDateRejectedInvoices(config);
+            Console.WriteLine($"已归档日期不符发票：{moved}");
+            return;
+        }
         if (arg == "--consolidate-pdf-invoices")
         {
             var output = new PdfInvoiceConsolidationService(workspace).Generate(config);

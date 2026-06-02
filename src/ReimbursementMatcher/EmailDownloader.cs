@@ -268,11 +268,16 @@ public sealed class EmailDownloader
             var duplicate = attachmentRows.Concat(linkRows).Count(r => r.GetValueOrDefault("status") is "重复跳过" or "重复发票");
             var hasRisk = attachmentRows.Concat(linkRows).Any(IsRiskRow);
             var processedRows = attachmentRows.Concat(linkRows).ToList();
+            var dateRejected = processedRows.Count(r => r.GetValueOrDefault("status") == "发票日期早于开始时间跳过");
             var onlyPdfSkipped = processedRows.Count > 0 && processedRows.All(r => r.GetValueOrDefault("status") == "PDF已存在跳过");
             var hasPdf = processedRows.Any(r => Path.GetExtension(r.GetValueOrDefault("file", "")).Equals(".pdf", StringComparison.OrdinalIgnoreCase));
             var hasNoInvoiceNumber = processedRows.Any(r => r.GetValueOrDefault("error", "").Contains("无发票号"));
             var downloadStatus = "";
-            var messageStatus = saved > 0 && hasPdf && !hasNoInvoiceNumber
+            var messageStatus = dateRejected > 0 && saved == 0
+                ? "发票日期早于开始时间跳过"
+                : hasRisk
+                    ? "异常"
+                    : saved > 0 && hasPdf && !hasNoInvoiceNumber
                 ? "正常已下载"
                 : duplicate > 0
                     ? "重复发票"
@@ -280,11 +285,10 @@ public sealed class EmailDownloader
                         ? "PDF已存在跳过"
                         : saved > 0 && !hasPdf
                             ? "异常"
-                            : hasRisk
-                                ? "异常"
-                                : "未下载到文件";
+                            : "未下载到文件";
             if (messageStatus == "正常已下载") downloadStatus = "正常已下载";
             else if (messageStatus == "重复发票") downloadStatus = "重复已忽略";
+            else if (messageStatus == "发票日期早于开始时间跳过") downloadStatus = "日期不符已忽略";
             else if (messageStatus == "异常" || messageStatus == "未下载到文件") downloadStatus = "异常";
 
             var messageError = BuildMessageError(processedRows, saved, hasPdf, hasNoInvoiceNumber);
@@ -470,7 +474,7 @@ public sealed class EmailDownloader
         var status = row.GetValueOrDefault("status", "");
         var error = row.GetValueOrDefault("error", "");
         return status is "失败" or "需人工确认" or "未下载到文件" or "待核验" or "异常"
-            || (!string.IsNullOrWhiteSpace(error) && status is not "PDF已存在跳过" and not "重复发票");
+            || (!string.IsNullOrWhiteSpace(error) && status is not "PDF已存在跳过" and not "重复发票" and not "发票日期早于开始时间跳过");
     }
 
     private static bool HasResolvedInvoiceFromAttachments(IEnumerable<Dictionary<string, string>> rows)
@@ -517,7 +521,8 @@ public sealed class EmailDownloader
         string messageKey,
         string url,
         string startDate,
-        EmailProcessingStore processingStore)
+        EmailProcessingStore processingStore,
+        Dictionary<string, string> existingHashes)
     {
         var metadata = File.Exists(save.Path) ? ExtractInvoiceMetadata(save.Path) : new InvoiceMetadata();
         var row = new Dictionary<string, string>
@@ -558,9 +563,14 @@ public sealed class EmailDownloader
         }
         if (IsInvoiceDateBeforeStart(metadata.Date, startDate))
         {
-            row["status"] = "异常";
-            row["download_status"] = "异常";
-            row["error"] = AppendReason(row.GetValueOrDefault("error", ""), "发票日期早于开始时间");
+            var archived = MoveDateRejectedFile(save.Path, startDate);
+            existingHashes.Remove(save.Sha256);
+            row["status"] = "发票日期早于开始时间跳过";
+            row["download_status"] = "日期不符已忽略";
+            row["error"] = AppendReason(row.GetValueOrDefault("error", ""), $"发票日期 {metadata.Date} 早于开始时间 {startDate}");
+            row["duplicate_of"] = archived;
+            row["file"] = "";
+            return row;
         }
 
         var duplicateInvoice = FindDuplicateInvoice(processingStore, save.Md5, save.Sha256, metadata);
@@ -631,6 +641,30 @@ public sealed class EmailDownloader
         return DateTime.TryParse(invoiceDate, out var invoice)
             && DateTime.TryParse(startDate, out var start)
             && invoice.Date < start.Date;
+    }
+
+    private static string MoveDateRejectedFile(string path, string startDate)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return "";
+        }
+
+        try
+        {
+            var dir = Path.GetDirectoryName(path) ?? "";
+            var archiveDir = Path.Combine(dir, "_日期不符发票", SafeFileName(startDate.Replace("-", "")));
+            Directory.CreateDirectory(archiveDir);
+            var target = UniquePath(Path.Combine(archiveDir, Path.GetFileName(path)));
+            File.Move(path, target);
+            File.WriteAllText(target + ".reason.txt", $"发票日期早于开始时间 {startDate}，不纳入本期报销。" + Environment.NewLine, Encoding.UTF8);
+            return target;
+        }
+        catch
+        {
+            TryDelete(path);
+            return "";
+        }
     }
 
     private static string AppendReason(string current, string reason)
@@ -822,7 +856,7 @@ public sealed class EmailDownloader
                 existingPdfKeys.Add(invoiceKey);
             }
 
-            var row = SavedFileRow("attachment", save, date, subject, sender, msgId, messageKey, "", startDate, processingStore);
+            var row = SavedFileRow("attachment", save, date, subject, sender, msgId, messageKey, "", startDate, processingStore, existingHashes);
             rows.Add(row);
 
             rows.AddRange(await ExtractZipIfNeededAsync(save.Path, outputDir, prefix, subject, sender, date, msgId, messageKey, startDate, existingHashes, existingPdfKeys, processingStore, ct));
@@ -909,7 +943,7 @@ public sealed class EmailDownloader
                     existingPdfKeys.Add(invoiceKey);
                 }
 
-                var row = SavedFileRow("link", save, date, subject, sender, msgId, messageKey, url, startDate, processingStore);
+                var row = SavedFileRow("link", save, date, subject, sender, msgId, messageKey, url, startDate, processingStore, existingHashes);
                 row["content_type"] = contentType;
                 rows.Add(row);
 
@@ -1014,7 +1048,7 @@ public sealed class EmailDownloader
                     existingPdfKeys.Add(invoiceKey);
                 }
 
-                var row = SavedFileRow("link_page_candidate", save, date, subject, sender, msgId, messageKey, candidate.Url, startDate, processingStore);
+                var row = SavedFileRow("link_page_candidate", save, date, subject, sender, msgId, messageKey, candidate.Url, startDate, processingStore, existingHashes);
                 row["status"] = row.GetValueOrDefault("status") == "已下载" ? "页面解析已下载" : row.GetValueOrDefault("status", "");
                 row["source_url"] = originalUrl;
                 row["content_type"] = contentType;
@@ -1362,7 +1396,7 @@ public sealed class EmailDownloader
     private static Dictionary<string, string> BuildExistingHashIndex(string outputDir)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var file in Directory.EnumerateFiles(outputDir, "*.*", SearchOption.AllDirectories))
+        foreach (var file in Directory.EnumerateFiles(outputDir, "*.*", SearchOption.AllDirectories).Where(f => !IsMaintenanceArchiveFile(f)))
         {
             try
             {
@@ -1383,6 +1417,7 @@ public sealed class EmailDownloader
     private static HashSet<string> BuildExistingPdfKeyIndex(string outputDir)
     {
         return Directory.EnumerateFiles(outputDir, "*.pdf", SearchOption.AllDirectories)
+            .Where(f => !IsMaintenanceArchiveFile(f))
             .Select(file => InvoiceFormatPolicy.InvoiceKey(Path.GetFileName(file), file))
             .Where(key => !string.IsNullOrWhiteSpace(key))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -1396,7 +1431,7 @@ public sealed class EmailDownloader
             return result;
         }
 
-        foreach (var file in Directory.EnumerateFiles(outputDir, "*.*", SearchOption.AllDirectories))
+        foreach (var file in Directory.EnumerateFiles(outputDir, "*.*", SearchOption.AllDirectories).Where(f => !IsMaintenanceArchiveFile(f)))
         {
             var extension = Path.GetExtension(file);
             if (extension.Equals(".csv", StringComparison.OrdinalIgnoreCase))
@@ -1440,6 +1475,14 @@ public sealed class EmailDownloader
         }
 
         return result;
+    }
+
+    private static bool IsMaintenanceArchiveFile(string file)
+    {
+        var normalized = file.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        return normalized.Contains($"{Path.DirectorySeparatorChar}非PDF重复格式_", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"{Path.DirectorySeparatorChar}日期不符发票_", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"{Path.DirectorySeparatorChar}_日期不符发票{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<SaveResult> SaveBytesAsync(byte[] bytes, string outputDir, string fileName, Dictionary<string, string> existingHashes, CancellationToken ct)
@@ -1506,7 +1549,7 @@ public sealed class EmailDownloader
                 {
                     existingPdfKeys.Add(invoiceKey);
                 }
-                rows.Add(SavedFileRow("zip_entry", save, date, subject, sender, msgId, messageKey, path, startDate, processingStore));
+                rows.Add(SavedFileRow("zip_entry", save, date, subject, sender, msgId, messageKey, path, startDate, processingStore, existingHashes));
             }
         }
         catch (Exception ex)
