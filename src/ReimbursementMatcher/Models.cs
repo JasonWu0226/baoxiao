@@ -10,6 +10,7 @@ public sealed class AppConfig
     public string OutputDir { get; set; } = "输出";
     public string RuleDir { get; set; } = "规则";
     public string ArchiveDir { get; set; } = "输出/归档";
+    public List<string> PreviousInvoiceDirs { get; set; } = new();
     public string Operator { get; set; } = "Jason";
     public string DateStart { get; set; } = "2026-01-01";
     public string DateEnd { get; set; } = "2026-04-30";

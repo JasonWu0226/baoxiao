@@ -43,6 +43,7 @@ public partial class Form1 : Form
     private readonly TextBox _templatePath = new();
     private readonly TextBox _outputDir = new();
     private readonly TextBox _ruleDir = new();
+    private readonly TextBox _previousInvoiceDirs = new();
     private readonly TextBox _operator = new();
     private readonly TextBox _dateStart = new();
     private readonly TextBox _dateEnd = new();
@@ -118,7 +119,7 @@ public partial class Form1 : Form
 
     private Control BuildTopPanel()
     {
-        var panel = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 4, RowCount = 4, AutoSize = true, BackColor = BackColor };
+        var panel = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 4, RowCount = 5, AutoSize = true, BackColor = BackColor };
         for (var i = 0; i < 4; i++) panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25f));
 
         AddLabeled(panel, "素材根目录", _sourceRoot, 0, 0, 2);
@@ -131,6 +132,7 @@ public partial class Form1 : Form
         AddLabeled(panel, "开始日期", _dateStart, 0, 2, 1);
         AddLabeled(panel, "结束日期", _dateEnd, 1, 2, 1);
         AddLabeled(panel, "发票目录", _invoiceDir, 2, 2, 2);
+        AddLabeled(panel, "上期发票目录(分号分隔)", _previousInvoiceDirs, 0, 3, 4);
 
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
         buttons.Controls.Add(Button("扫描原始素材", (_, _) => ScanMaterials(), primary: true));
@@ -141,7 +143,7 @@ public partial class Form1 : Form
         buttons.Controls.Add(Button("打开输出目录", (_, _) => OpenDir(_outputDir.Text)));
         buttons.Controls.Add(Button("打开发票目录", (_, _) => OpenDir(_invoiceDir.Text)));
         buttons.Controls.Add(_summary);
-        panel.Controls.Add(buttons, 0, 3);
+        panel.Controls.Add(buttons, 0, 4);
         panel.SetColumnSpan(buttons, 4);
         return panel;
     }
@@ -539,6 +541,7 @@ public partial class Form1 : Form
         _operator.Text = _config.Operator;
         _dateStart.Text = _config.DateStart;
         _dateEnd.Text = _config.DateEnd;
+        _previousInvoiceDirs.Text = string.Join(";", _config.PreviousInvoiceDirs);
 
         _emailEnabled.Checked = _config.Email.Enabled;
         _emailHost.Text = _config.Email.Host;
@@ -574,6 +577,10 @@ public partial class Form1 : Form
         _config.Operator = _operator.Text.Trim();
         _config.DateStart = _dateStart.Text.Trim();
         _config.DateEnd = _dateEnd.Text.Trim();
+        _config.PreviousInvoiceDirs = _previousInvoiceDirs.Text
+            .Split([';', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
         _config.Email.Enabled = _emailEnabled.Checked;
         _config.Email.Host = _emailHost.Text.Trim();

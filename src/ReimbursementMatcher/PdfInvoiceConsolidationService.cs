@@ -62,10 +62,16 @@ public sealed class PdfInvoiceConsolidationService
             }
         }
 
+        var previous = BuildPreviousIndex(config, invoiceDir);
         foreach (var row in unique)
         {
             row.ReviewFlag = BuildReviewFlag(row);
             row.MergeGroup = BuildMergeGroup(row);
+            row.PreviousMatch = FindPreviousMatch(row, previous);
+            if (!string.IsNullOrWhiteSpace(row.PreviousMatch.MatchType))
+            {
+                row.ReviewFlag = MergeFlag(row.ReviewFlag, "疑似上期已报销");
+            }
         }
 
         var workbookPath = Path.Combine(outputRoot, "PDF发票归集核验.xlsx");
@@ -133,12 +139,84 @@ public sealed class PdfInvoiceConsolidationService
         return target;
     }
 
+    private List<PreviousInvoiceRow> BuildPreviousIndex(AppConfig config, string currentInvoiceDir)
+    {
+        var roots = config.PreviousInvoiceDirs
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(_workspace.Resolve)
+            .Where(Directory.Exists)
+            .Where(dir => !Path.GetFullPath(dir).Equals(Path.GetFullPath(currentInvoiceDir), StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return roots
+            .SelectMany(root => Directory.EnumerateFiles(root, "*.pdf", SearchOption.AllDirectories)
+                .Select(file => new { Root = root, File = file }))
+            .Select(x =>
+            {
+                var row = ReadPdf(x.File);
+                return new PreviousInvoiceRow
+                {
+                    Root = x.Root,
+                    SourcePath = row.SourcePath,
+                    Sha256 = row.Sha256,
+                    InvoiceNumber = row.InvoiceNumber,
+                    Amount = row.Amount,
+                    InvoiceDate = row.InvoiceDate,
+                    Vendor = row.Vendor,
+                    Category = row.Category
+                };
+            })
+            .ToList();
+    }
+
+    private static PreviousMatchResult FindPreviousMatch(PdfInvoiceRow row, List<PreviousInvoiceRow> previous)
+    {
+        if (previous.Count == 0)
+        {
+            return new PreviousMatchResult();
+        }
+
+        if (!string.IsNullOrWhiteSpace(row.InvoiceNumber))
+        {
+            var exactNo = previous.FirstOrDefault(p => p.InvoiceNumber.Equals(row.InvoiceNumber, StringComparison.OrdinalIgnoreCase));
+            if (exactNo != null)
+            {
+                return PreviousMatchResult.From("发票号一致", exactNo);
+            }
+        }
+
+        var exactHash = previous.FirstOrDefault(p => !string.IsNullOrWhiteSpace(row.Sha256) && p.Sha256 == row.Sha256);
+        if (exactHash != null)
+        {
+            return PreviousMatchResult.From("文件哈希一致", exactHash);
+        }
+
+        if (row.Amount > 0 && !string.IsNullOrWhiteSpace(row.InvoiceDate))
+        {
+            var fuzzy = previous.FirstOrDefault(p =>
+                p.Amount == row.Amount
+                && p.InvoiceDate == row.InvoiceDate
+                && !string.IsNullOrWhiteSpace(row.Vendor)
+                && !string.IsNullOrWhiteSpace(p.Vendor)
+                && (row.Vendor.Contains(p.Vendor, StringComparison.OrdinalIgnoreCase)
+                    || p.Vendor.Contains(row.Vendor, StringComparison.OrdinalIgnoreCase)));
+            if (fuzzy != null)
+            {
+                return PreviousMatchResult.From("日期金额销售方疑似一致", fuzzy);
+            }
+        }
+
+        return new PreviousMatchResult();
+    }
+
     private static void WriteWorkbook(string path, List<PdfInvoiceRow> unique, List<PdfInvoiceRow> duplicates, string outputRoot)
     {
         using var wb = new XLWorkbook();
         WriteSummarySheet(wb, unique, duplicates, outputRoot);
         WriteInvoiceSheet(wb, "唯一PDF发票", unique);
         WriteInvoiceSheet(wb, "待补充核验", unique.Where(r => !string.IsNullOrWhiteSpace(r.ReviewFlag)).ToList());
+        WritePreviousOverlapSheet(wb, unique.Where(r => !string.IsNullOrWhiteSpace(r.PreviousMatch.MatchType)).ToList());
         WriteDuplicateSheet(wb, duplicates);
         WriteMergeSheet(wb, BuildMergeGroups(unique));
         wb.SaveAs(path);
@@ -154,6 +232,8 @@ public sealed class PdfInvoiceConsolidationService
             ("重复PDF数量", duplicates.Count),
             ("唯一PDF金额合计", unique.Sum(r => r.Amount)),
             ("待补充核验数量", unique.Count(r => !string.IsNullOrWhiteSpace(r.ReviewFlag))),
+            ("疑似上期已报销数量", unique.Count(r => !string.IsNullOrWhiteSpace(r.PreviousMatch.MatchType))),
+            ("疑似上期已报销金额", unique.Where(r => !string.IsNullOrWhiteSpace(r.PreviousMatch.MatchType)).Sum(r => r.Amount)),
             ("高速/通行费数量", unique.Count(r => r.Category == "高速/通行费")),
             ("高速/通行费金额", unique.Where(r => r.Category == "高速/通行费").Sum(r => r.Amount)),
             ("滴滴/网约车数量", unique.Count(r => r.Category == "滴滴/网约车")),
@@ -185,7 +265,7 @@ public sealed class PdfInvoiceConsolidationService
         var headers = new[]
         {
             "类别", "合并组", "开票日期", "金额", "发票号", "销售方/抬头识别", "核验提示",
-            "归集PDF", "原始PDF", "SHA256"
+            "上期匹配类型", "上期文件", "归集PDF", "原始PDF", "SHA256"
         };
         WriteHeaders(ws, headers);
         var r = 2;
@@ -199,13 +279,51 @@ public sealed class PdfInvoiceConsolidationService
             ws.Cell(r, 5).Value = row.InvoiceNumber;
             ws.Cell(r, 6).Value = row.Vendor;
             ws.Cell(r, 7).Value = row.ReviewFlag;
-            ws.Cell(r, 8).Value = row.CopiedPath;
-            ws.Cell(r, 9).Value = row.SourcePath;
-            ws.Cell(r, 10).Value = row.Sha256;
-            if (!string.IsNullOrWhiteSpace(row.ReviewFlag))
+            ws.Cell(r, 8).Value = row.PreviousMatch.MatchType;
+            ws.Cell(r, 9).Value = row.PreviousMatch.SourcePath;
+            ws.Cell(r, 10).Value = row.CopiedPath;
+            ws.Cell(r, 11).Value = row.SourcePath;
+            ws.Cell(r, 12).Value = row.Sha256;
+            if (!string.IsNullOrWhiteSpace(row.PreviousMatch.MatchType))
+            {
+                ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = XLColor.FromHtml("#F4CCCC");
+            }
+            else if (!string.IsNullOrWhiteSpace(row.ReviewFlag))
             {
                 ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = XLColor.FromHtml("#FFF2CC");
             }
+            r++;
+        }
+        FormatSheet(ws, headers.Length);
+    }
+
+    private static void WritePreviousOverlapSheet(XLWorkbook wb, List<PdfInvoiceRow> rows)
+    {
+        var ws = wb.Worksheets.Add("上期重叠核验");
+        var headers = new[]
+        {
+            "匹配类型", "本期类别", "本期开票日期", "本期金额", "本期发票号", "本期销售方",
+            "上期开票日期", "上期金额", "上期发票号", "上期销售方", "本期归集PDF", "上期文件"
+        };
+        WriteHeaders(ws, headers);
+        var r = 2;
+        foreach (var row in rows)
+        {
+            ws.Cell(r, 1).Value = row.PreviousMatch.MatchType;
+            ws.Cell(r, 2).Value = row.Category;
+            ws.Cell(r, 3).Value = row.InvoiceDate;
+            ws.Cell(r, 4).Value = row.Amount;
+            ws.Cell(r, 4).Style.NumberFormat.Format = "¥#,##0.00";
+            ws.Cell(r, 5).Value = row.InvoiceNumber;
+            ws.Cell(r, 6).Value = row.Vendor;
+            ws.Cell(r, 7).Value = row.PreviousMatch.InvoiceDate;
+            ws.Cell(r, 8).Value = row.PreviousMatch.Amount;
+            ws.Cell(r, 8).Style.NumberFormat.Format = "¥#,##0.00";
+            ws.Cell(r, 9).Value = row.PreviousMatch.InvoiceNumber;
+            ws.Cell(r, 10).Value = row.PreviousMatch.Vendor;
+            ws.Cell(r, 11).Value = row.CopiedPath;
+            ws.Cell(r, 12).Value = row.PreviousMatch.SourcePath;
+            ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = XLColor.FromHtml("#F4CCCC");
             r++;
         }
         FormatSheet(ws, headers.Length);
@@ -291,6 +409,12 @@ public sealed class PdfInvoiceConsolidationService
         if (string.IsNullOrWhiteSpace(row.InvoiceDate)) flags.Add("开票日期未识别");
         if (row.Category == "其他发票") flags.Add("类别待确认");
         return string.Join("；", flags);
+    }
+
+    private static string MergeFlag(string left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left)) return right;
+        return left.Contains(right, StringComparison.OrdinalIgnoreCase) ? left : $"{left}；{right}";
     }
 
     private static string BuildMergeGroup(PdfInvoiceRow row)
@@ -479,7 +603,40 @@ public sealed class PdfInvoiceConsolidationService
         public string Category { get; set; } = "";
         public string MergeGroup { get; set; } = "";
         public string ReviewFlag { get; set; } = "";
+        public PreviousMatchResult PreviousMatch { get; set; } = new();
         public int TextLength { get; set; }
+    }
+
+    private sealed class PreviousInvoiceRow
+    {
+        public string Root { get; set; } = "";
+        public string SourcePath { get; set; } = "";
+        public string Sha256 { get; set; } = "";
+        public string InvoiceNumber { get; set; } = "";
+        public decimal Amount { get; set; }
+        public string InvoiceDate { get; set; } = "";
+        public string Vendor { get; set; } = "";
+        public string Category { get; set; } = "";
+    }
+
+    private sealed class PreviousMatchResult
+    {
+        public string MatchType { get; set; } = "";
+        public string SourcePath { get; set; } = "";
+        public string InvoiceNumber { get; set; } = "";
+        public decimal Amount { get; set; }
+        public string InvoiceDate { get; set; } = "";
+        public string Vendor { get; set; } = "";
+
+        public static PreviousMatchResult From(string matchType, PreviousInvoiceRow row) => new()
+        {
+            MatchType = matchType,
+            SourcePath = row.SourcePath,
+            InvoiceNumber = row.InvoiceNumber,
+            Amount = row.Amount,
+            InvoiceDate = row.InvoiceDate,
+            Vendor = row.Vendor
+        };
     }
 
     private sealed class MergeGroupRow
