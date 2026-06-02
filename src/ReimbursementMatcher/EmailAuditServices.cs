@@ -53,12 +53,7 @@ public sealed class EmailAuditService
 
     public List<EmailAuditItem> LoadLatestAudit(AppConfig config, EmailDecisionStore decisions)
     {
-        var invoiceDir = _workspace.Resolve(config.Email.OutputDir);
-        var latest = Directory.Exists(invoiceDir)
-            ? Directory.EnumerateFiles(invoiceDir, "邮箱发票下载清单_*.csv", SearchOption.TopDirectoryOnly)
-                .OrderByDescending(File.GetLastWriteTime)
-                .FirstOrDefault()
-            : null;
+        var latest = FindLatestManifest(config);
         if (latest == null)
         {
             return [];
@@ -124,6 +119,57 @@ public sealed class EmailAuditService
         return output;
     }
 
+    public string GenerateInvoicePresenceExcel(AppConfig config, List<EmailAuditItem> items)
+    {
+        var outputDir = _workspace.Resolve(config.OutputDir);
+        Directory.CreateDirectory(outputDir);
+        var output = Path.Combine(outputDir, $"发票存在性核验_{DateTime.Now:yyyyMMdd_HHmmss}.xlsx");
+        var invoiceDir = _workspace.Resolve(config.InvoiceDir);
+
+        var rows = items.Select(BuildPresenceRow).ToList();
+        var needCheck = rows
+            .Where(r => r.NextAction != "无需处理")
+            .OrderBy(r => r.Date)
+            .ThenBy(r => r.Subject)
+            .ToList();
+        var confirmed = rows
+            .Where(r => r.FinalDecision == HasInvoice && r.ExistingFileCount > 0)
+            .OrderBy(r => r.Date)
+            .ThenBy(r => r.Subject)
+            .ToList();
+        var noInvoice = rows
+            .Where(r => r.FinalDecision == NoInvoice)
+            .OrderBy(r => r.Date)
+            .ThenBy(r => r.Subject)
+            .ToList();
+        var imageFiles = Directory.Exists(invoiceDir)
+            ? Directory.EnumerateFiles(invoiceDir, "*.*", SearchOption.AllDirectories)
+                .Where(IsImageOrIcon)
+                .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}非PDF图片清理_", StringComparison.OrdinalIgnoreCase))
+                .Select(f => new NonPdfReviewRow
+                {
+                    Type = Path.GetExtension(f).Equals(".ico", StringComparison.OrdinalIgnoreCase) ? "ICO图标" : "图片/可能二维码",
+                    NextAction = Path.GetExtension(f).Equals(".ico", StringComparison.OrdinalIgnoreCase)
+                        ? "可归档，肯定不是发票"
+                        : "打开查看；如为二维码则执行“处理非PDF/二维码/AI判断”",
+                    File = f,
+                    SizeKb = new FileInfo(f).Length / 1024
+                })
+                .OrderBy(r => r.Type)
+                .ThenBy(r => r.File)
+                .ToList()
+            : [];
+
+        using var wb = new XLWorkbook();
+        WritePresenceSheet(wb, "需要逐封核验", needCheck);
+        WritePresenceSheet(wb, "有发票且已存在", confirmed);
+        WritePresenceSheet(wb, "明确无发票", noInvoice);
+        WriteNonPdfSheet(wb, "二维码与非PDF图片", imageFiles);
+        WritePresenceSummary(wb, rows, imageFiles);
+        wb.SaveAs(output);
+        return output;
+    }
+
     public string SaveDownloadRules(AppConfig config, List<EmailAuditItem> items)
     {
         var path = Path.Combine(_workspace.Resolve(config.RuleDir), "邮件下载规则.json");
@@ -170,6 +216,25 @@ public sealed class EmailAuditService
         }
     }
 
+    private string? FindLatestManifest(AppConfig config)
+    {
+        var candidates = new[]
+            {
+                config.Email.OutputDir,
+                config.InvoiceDir,
+                "历史发票"
+            }
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .Select(_workspace.Resolve)
+            .Where(Directory.Exists)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .SelectMany(dir => Directory.EnumerateFiles(dir, "邮箱发票下载清单_*.csv", SearchOption.TopDirectoryOnly))
+            .OrderByDescending(File.GetLastWriteTime)
+            .ToList();
+
+        return candidates.FirstOrDefault();
+    }
+
     private static string GroupKey(Dictionary<string, string> row, Dictionary<string, string> messageKeyById)
     {
         var messageKey = Get(row, "message_key");
@@ -192,6 +257,7 @@ public sealed class EmailAuditService
         var date = rows.Select(r => Get(r, "date")).FirstOrDefault(s => !string.IsNullOrWhiteSpace(s)) ?? historical?.Date ?? "";
         var msgId = rows.Select(r => Get(r, "msg_id")).FirstOrDefault(s => !string.IsNullOrWhiteSpace(s)) ?? historical?.MessageId ?? key;
         var files = rows.Select(r => Get(r, "file"))
+            .Concat(rows.Select(r => Get(r, "duplicate_of")))
             .Concat(historical?.Files ?? [])
             .Concat(historical?.SavedFiles.Select(f => f.Path) ?? [])
             .Where(v => !string.IsNullOrWhiteSpace(v))
@@ -368,6 +434,167 @@ public sealed class EmailAuditService
         ws.Columns().AdjustToContents();
     }
 
+    private static PresenceReviewRow BuildPresenceRow(EmailAuditItem item)
+    {
+        var existingFiles = SplitFileList(item.Files)
+            .Where(File.Exists)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var hasLink = !string.IsNullOrWhiteSpace(item.Urls);
+        var isLinkPending = item.Status.Contains("链接取票待处理", StringComparison.OrdinalIgnoreCase)
+            || item.Reason.Contains("链接取票待处理", StringComparison.OrdinalIgnoreCase);
+        var hasInvoice = item.FinalDecision == HasInvoice;
+        var needsReview = item.FinalDecision == NeedsReview || item.NeedsHumanReview;
+
+        var status = hasInvoice && existingFiles.Count > 0
+            ? "已确认存在"
+            : hasInvoice && item.SkippedOrDuplicateCount > 0 && existingFiles.Count == 0
+                ? "有发票但仅显示重复/跳过"
+                : hasInvoice
+                    ? "有发票但未找到本地文件"
+                    : needsReview
+                        ? "需要判断是否有发票"
+                        : "明确无发票";
+
+        var action = status switch
+        {
+            "已确认存在" => "无需处理",
+            "明确无发票" => "无需处理",
+            "有发票但仅显示重复/跳过" => "打开下载清单核对重复来源；必要时重新下载异常邮件",
+            "有发票但未找到本地文件" when isLinkPending || hasLink => "打开链接或二维码取票；下载后重新生成核验表",
+            "有发票但未找到本地文件" => "重新下载该邮件或人工打开邮件核对附件",
+            _ => "人工确认有无发票；确认后保存下载规则"
+        };
+
+        return new PresenceReviewRow
+        {
+            CheckStatus = status,
+            NextAction = action,
+            FinalDecision = item.FinalDecision,
+            RuleDecision = item.RuleDecision,
+            ManualDecision = item.ManualDecision,
+            Date = item.Date,
+            Subject = item.Subject,
+            Status = item.Status,
+            AttachmentCount = item.AttachmentCount,
+            DownloadedFileCount = item.DownloadedFileCount,
+            SkippedOrDuplicateCount = item.SkippedOrDuplicateCount,
+            ExistingFileCount = existingFiles.Count,
+            Reason = item.Reason,
+            Files = item.Files,
+            ExistingFiles = string.Join(Environment.NewLine, existingFiles),
+            Urls = item.Urls,
+            Note = item.Note
+        };
+    }
+
+    private static void WritePresenceSheet(XLWorkbook wb, string name, List<PresenceReviewRow> rows)
+    {
+        var ws = wb.Worksheets.Add(name);
+        var headers = new[]
+        {
+            "核验状态", "下一步动作", "最终判断", "规则判断", "人工判断", "日期", "邮件主题", "下载状态",
+            "附件数", "下载数", "重复/跳过数", "本地存在文件数", "判断原因", "本地存在文件", "文件清单", "链接清单", "备注"
+        };
+        for (var c = 0; c < headers.Length; c++)
+        {
+            ws.Cell(1, c + 1).Value = headers[c];
+            ws.Cell(1, c + 1).Style.Font.Bold = true;
+        }
+
+        var r = 2;
+        foreach (var row in rows)
+        {
+            ws.Cell(r, 1).Value = row.CheckStatus;
+            ws.Cell(r, 2).Value = row.NextAction;
+            ws.Cell(r, 3).Value = row.FinalDecision;
+            ws.Cell(r, 4).Value = row.RuleDecision;
+            ws.Cell(r, 5).Value = row.ManualDecision;
+            ws.Cell(r, 6).Value = row.Date;
+            ws.Cell(r, 7).Value = row.Subject;
+            ws.Cell(r, 8).Value = row.Status;
+            ws.Cell(r, 9).Value = row.AttachmentCount;
+            ws.Cell(r, 10).Value = row.DownloadedFileCount;
+            ws.Cell(r, 11).Value = row.SkippedOrDuplicateCount;
+            ws.Cell(r, 12).Value = row.ExistingFileCount;
+            ws.Cell(r, 13).Value = row.Reason;
+            ws.Cell(r, 14).Value = row.ExistingFiles;
+            ws.Cell(r, 15).Value = row.Files;
+            ws.Cell(r, 16).Value = row.Urls;
+            ws.Cell(r, 17).Value = row.Note;
+            ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = row.NextAction == "无需处理"
+                ? XLColor.FromHtml("#D9EAD3")
+                : XLColor.FromHtml("#FFF2CC");
+            r++;
+        }
+
+        ws.Columns().AdjustToContents(8, 70);
+        ws.SheetView.FreezeRows(1);
+    }
+
+    private static void WriteNonPdfSheet(XLWorkbook wb, string name, List<NonPdfReviewRow> rows)
+    {
+        var ws = wb.Worksheets.Add(name);
+        var headers = new[] { "类型", "下一步动作", "大小KB", "文件" };
+        for (var c = 0; c < headers.Length; c++)
+        {
+            ws.Cell(1, c + 1).Value = headers[c];
+            ws.Cell(1, c + 1).Style.Font.Bold = true;
+        }
+        var r = 2;
+        foreach (var row in rows)
+        {
+            ws.Cell(r, 1).Value = row.Type;
+            ws.Cell(r, 2).Value = row.NextAction;
+            ws.Cell(r, 3).Value = row.SizeKb;
+            ws.Cell(r, 4).Value = row.File;
+            ws.Range(r, 1, r, headers.Length).Style.Fill.BackgroundColor = row.Type == "ICO图标"
+                ? XLColor.FromHtml("#E5E7EB")
+                : XLColor.FromHtml("#FFF2CC");
+            r++;
+        }
+        ws.Columns().AdjustToContents(8, 80);
+        ws.SheetView.FreezeRows(1);
+    }
+
+    private static void WritePresenceSummary(XLWorkbook wb, List<PresenceReviewRow> rows, List<NonPdfReviewRow> nonPdfRows)
+    {
+        var ws = wb.Worksheets.Add("统计汇总");
+        var metrics = new (string Name, int Count)[]
+        {
+            ("邮件总数", rows.Count),
+            ("明确有发票邮件", rows.Count(r => r.FinalDecision == HasInvoice)),
+            ("有发票且本地已存在", rows.Count(r => r.FinalDecision == HasInvoice && r.ExistingFileCount > 0)),
+            ("有发票但需继续核验", rows.Count(r => r.FinalDecision == HasInvoice && r.NextAction != "无需处理")),
+            ("需要人工判断邮件", rows.Count(r => r.FinalDecision == NeedsReview)),
+            ("明确无发票邮件", rows.Count(r => r.FinalDecision == NoInvoice)),
+            ("图片/二维码候选", nonPdfRows.Count(r => r.Type != "ICO图标")),
+            ("ICO图标", nonPdfRows.Count(r => r.Type == "ICO图标"))
+        };
+        ws.Cell(1, 1).Value = "指标";
+        ws.Cell(1, 2).Value = "数量";
+        ws.Range(1, 1, 1, 2).Style.Font.Bold = true;
+        for (var i = 0; i < metrics.Length; i++)
+        {
+            ws.Cell(i + 2, 1).Value = metrics[i].Name;
+            ws.Cell(i + 2, 2).Value = metrics[i].Count;
+        }
+        ws.Columns().AdjustToContents();
+    }
+
+    private static List<string> SplitFileList(string files)
+    {
+        return Regex.Split(files ?? "", @"[\r\n；;]+")
+            .Select(v => v.Trim())
+            .Where(v => !string.IsNullOrWhiteSpace(v))
+            .ToList();
+    }
+
+    private static bool IsImageOrIcon(string file)
+    {
+        return Path.GetExtension(file).ToLowerInvariant() is ".ico" or ".png" or ".jpg" or ".jpeg" or ".webp";
+    }
+
     private static List<Dictionary<string, string>> ReadCsv(string path)
     {
         var lines = File.ReadAllLines(path, Encoding.UTF8);
@@ -411,4 +638,33 @@ public sealed class EmailAuditService
         "发票", "电子发票", "发票金额", "报销凭证", "电子报销凭证", "行程单", "客票行程单", "invoice", "fapiao", "dzfp", ".ofd", ".pdf", ".xml", ".zip", "开票");
     private static bool ContainsAny(string value, params string[] keywords) => keywords.Any(k => value.Contains(k, StringComparison.OrdinalIgnoreCase));
     private static List<string> ExtractKeywords(string subject) => Regex.Matches(subject, @"[\u4e00-\u9fffA-Za-z0-9]{2,}").Select(m => m.Value).Where(v => v.Length >= 2 && !Regex.IsMatch(v, @"^\d+$")).Distinct(StringComparer.OrdinalIgnoreCase).Take(12).ToList();
+
+    private sealed class PresenceReviewRow
+    {
+        public string CheckStatus { get; set; } = "";
+        public string NextAction { get; set; } = "";
+        public string FinalDecision { get; set; } = "";
+        public string RuleDecision { get; set; } = "";
+        public string ManualDecision { get; set; } = "";
+        public string Date { get; set; } = "";
+        public string Subject { get; set; } = "";
+        public string Status { get; set; } = "";
+        public int AttachmentCount { get; set; }
+        public int DownloadedFileCount { get; set; }
+        public int SkippedOrDuplicateCount { get; set; }
+        public int ExistingFileCount { get; set; }
+        public string Reason { get; set; } = "";
+        public string Files { get; set; } = "";
+        public string ExistingFiles { get; set; } = "";
+        public string Urls { get; set; } = "";
+        public string Note { get; set; } = "";
+    }
+
+    private sealed class NonPdfReviewRow
+    {
+        public string Type { get; set; } = "";
+        public string NextAction { get; set; } = "";
+        public string File { get; set; } = "";
+        public long SizeKb { get; set; }
+    }
 }

@@ -278,6 +278,7 @@ public partial class Form1 : Form
         buttons.Controls.Add(_hideDoneEmailAudit);
         buttons.Controls.Add(Button("读取邮件判断清单", (_, _) => LoadEmailAuditItems(), primary: true));
         buttons.Controls.Add(Button("生成邮件判断Excel", (_, _) => GenerateEmailChecklistExcel()));
+        buttons.Controls.Add(Button("生成发票存在性核验Excel", (_, _) => GenerateInvoicePresenceExcel()));
         buttons.Controls.Add(Button("保存下载规则", (_, _) => SaveEmailDownloadRules()));
         buttons.Controls.Add(Button("大模型判断待确认", async (s, _) => await AiReviewPendingEmailsAsync(s as Button)));
         buttons.Controls.Add(Button("选中标有发票", (_, _) => ConfirmSelectedEmails(EmailAuditService.HasInvoice)));
@@ -1038,6 +1039,16 @@ public partial class Form1 : Form
         if (_allEmailAuditItems.Count == 0) return;
         var output = _emailAuditService.GenerateChecklistExcel(_config, _allEmailAuditItems);
         Log($"已生成邮件发票判断清单：{output}");
+        Process.Start(new ProcessStartInfo(output) { UseShellExecute = true });
+    }
+
+    private void GenerateInvoicePresenceExcel()
+    {
+        SaveConfig();
+        if (_allEmailAuditItems.Count == 0) LoadEmailAuditItems(showMessageWhenMissing: false);
+        if (_allEmailAuditItems.Count == 0) return;
+        var output = _emailAuditService.GenerateInvoicePresenceExcel(_config, _allEmailAuditItems);
+        Log($"已生成发票存在性核验表：{output}");
         Process.Start(new ProcessStartInfo(output) { UseShellExecute = true });
     }
 

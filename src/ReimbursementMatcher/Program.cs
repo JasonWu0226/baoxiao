@@ -60,6 +60,15 @@ static class Program
             Console.WriteLine(output);
             return;
         }
+        if (arg == "--email-presence-check")
+        {
+            var service = new EmailAuditService(workspace);
+            var store = service.LoadDecisions(config);
+            var items = service.LoadLatestAudit(config, store);
+            var output = service.GenerateInvoicePresenceExcel(config, items);
+            Console.WriteLine(output);
+            return;
+        }
         if (arg == "--email-download" || arg == "--email-download-abnormal")
         {
             var password = config.Email.Password;
